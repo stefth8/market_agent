@@ -17,11 +17,13 @@ ACCOUNTS = [
     "GoldmanSachs", "CathieDWood", "michael_saylor", "WarrenBuffett",
     "nouriel", "RayDalio", "jimcramer", "PeterSchiff",
     "VitalikButerin", "cz_binance", "SEC_News", "IMFNews",
-    "business", "Reuters", "WSJ", "zerohedge"
+    "business", "Reuters", "WSJ", "zerohedge",
+    "thelonginvest", "unusual_whales"
 ]
 
 TWEETS_PER_ACCOUNT = 3
 MIN_SIGNAL_SCORE = 6
+RUN_INTERVAL_HOURS = 1
 
 def fetch_tweets(username):
     url = "https://api.twitterapi.io/twitter/user/last_tweets"
@@ -153,5 +155,5 @@ def run():
 if __name__ == "__main__":
     while True:
         run()
-        print("\nSleeping 4 hours...\n")
-        time.sleep(4 * 60 * 60)
+        print(f"\nSleeping {RUN_INTERVAL_HOURS} hour(s)...\n")
+        time.sleep(RUN_INTERVAL_HOURS * 60 * 60)
