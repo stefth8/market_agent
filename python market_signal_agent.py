@@ -14,8 +14,8 @@ TELEGRAM_CHAT_IDS = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
 
 ACCOUNTS = [
     "elonmusk", "realDonaldTrump", "federalreserve", "jpmorgan",
-    "GoldmanSachs", "CathieDWood", "michael_saylor", "WarrenBuffett",
-    "nouriel", "RayDalio", "jimcramer", "PeterSchiff",
+    "GoldmanSachs", "michael_saylor", "WarrenBuffett",
+    "nouriel", "RayDalio", "PeterSchiff",
     "VitalikButerin", "cz_binance", "SEC_News", "IMFNews",
     "business", "Reuters", "WSJ", "zerohedge",
     "thelonginvest", "unusual_whales"
