@@ -33,17 +33,16 @@ ASSET_MAP = {
 }
 
 TWEETS_PER_ACCOUNT = 3
-MIN_SIGNAL_SCORE = 6
+MIN_SIGNAL_SCORE = 8
 RUN_INTERVAL_HOURS = 1
 PAPER_TRADE_SIZE = 1000
 LOG_FILE = "/tmp/trades_log.csv"
-BATCH_SIZE = 5  # accounts per Claude call
+BATCH_SIZE = 5
 
 previous_signals = {}
-open_positions = {}
 
 # ============================================================
-# ALPACA
+# ALPACA HELPERS
 # ============================================================
 def alpaca_headers():
     return {
@@ -63,33 +62,81 @@ def get_price(symbol):
         print(f"  [ERROR] Price for {symbol}: {e}")
         return None
 
-def place_paper_trade(symbol, side, usd_amount):
+def get_open_positions():
+    """Get all currently open positions from Alpaca — persistent across restarts"""
     try:
+        r = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_headers(), timeout=10)
+        if r.status_code == 200:
+            positions = r.json()
+            return {p["symbol"].upper() for p in positions}
+        return set()
+    except Exception as e:
+        print(f"  [ERROR] Get positions: {e}")
+        return set()
+
+def parse_pct(pct_str, default=5.0):
+    """Parse percentage strings like '+8%', '-5%', '+8-12%' -> float"""
+    try:
+        clean = str(pct_str).replace("%", "").replace("+", "").strip()
+        # Handle ranges like "8-12" — take lower end
+        if "-" in clean.lstrip("-"):
+            parts = clean.lstrip("-").split("-")
+            val = float(parts[0])
+            if pct_str.strip().startswith("-"):
+                val = -val
+        else:
+            val = float(clean)
+        return abs(val)
+    except:
+        return default
+
+def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_pct_str):
+    """Place bracket order with take-profit and stop-loss built in"""
+    try:
+        # Calculate quantity from dollar amount
+        qty = round(usd_amount / current_price, 6)
+        if qty <= 0:
+            print(f"  [ERROR] Invalid qty for {symbol}")
+            return None
+
+        # Calculate prices
+        target_pct = parse_pct(target_pct_str, default=5.0)
+        stop_pct = parse_pct(stop_pct_str, default=3.0)
+
+        take_profit_price = round(current_price * (1 + target_pct / 100), 2)
+        stop_loss_price = round(current_price * (1 - stop_pct / 100), 2)
+
+        print(f"  [BRACKET] {symbol} qty={qty} @ ${current_price} | TP=${take_profit_price} | SL=${stop_loss_price}")
+
         url = f"{ALPACA_BASE_URL}/orders"
-        body = {"symbol": symbol.upper(), "notional": str(usd_amount), "side": side, "type": "market", "time_in_force": "day"}
+        body = {
+            "symbol": symbol.upper(),
+            "qty": str(qty),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "gtc",
+            "order_class": "bracket",
+            "take_profit": {
+                "limit_price": str(take_profit_price)
+            },
+            "stop_loss": {
+                "stop_price": str(stop_loss_price)
+            }
+        }
+
         r = requests.post(url, headers=alpaca_headers(), json=body, timeout=10)
         data = r.json()
+
         if r.status_code in [200, 201]:
-            print(f"  [TRADE] {side.upper()} ${usd_amount} of {symbol} — ID: {data.get('id')}")
+            print(f"  [TRADE OK] {symbol} bracket order placed — ID: {data.get('id')}")
             return data
         else:
-            print(f"  [ERROR] Trade failed {symbol}: {data}")
+            print(f"  [ERROR] Bracket order failed {symbol}: {data}")
             return None
-    except Exception as e:
-        print(f"  [ERROR] Trade: {e}")
-        return None
 
-def close_position(symbol):
-    try:
-        r = requests.delete(f"{ALPACA_BASE_URL}/positions/{symbol.upper()}", headers=alpaca_headers(), timeout=10)
-        if r.status_code in [200, 201, 204]:
-            print(f"  [CLOSE] {symbol} closed")
-            return True
-        print(f"  [ERROR] Close {symbol}: {r.text}")
-        return False
     except Exception as e:
-        print(f"  [ERROR] Close: {e}")
-        return False
+        print(f"  [ERROR] Bracket order: {e}")
+        return None
 
 # ============================================================
 # SYMBOL RESOLVER
@@ -144,25 +191,28 @@ def fetch_tweets(username):
         return []
 
 # ============================================================
-# ANALYSE BATCH WITH CLAUDE
+# ANALYSE WITH CLAUDE
 # ============================================================
 def analyse_batch(tweets_batch, prev_signals):
     tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_batch])
-
     prev_text = ""
     if prev_signals:
         prev_text = "\n\nPREVIOUS SIGNALS:\n" + "\n".join([f"- {a}: {i['direction']} ({i['confidence']}/10)" for a, i in prev_signals.items()])
 
     prompt = f"""You are an expert financial signal analyst. Analyse these tweets and identify market-moving signals.
 
+STRICT RULES - only flag signals that are DIRECTLY market-moving:
+INCLUDE: earnings beats/misses, CEO changes, mergers/acquisitions, central bank decisions, war escalation with specific supply impact, regulatory actions, major macro data
+EXCLUDE: retweets of general news, social commentary, opinion posts, product demos, general AI hype, vague geopolitical commentary
+
 Return a JSON array where each item has:
-- "account", "tweet_summary", "asset_affected" (include ticker e.g. "Apple (AAPL)", "Gold (GLD)"),
+- "account", "tweet_summary", "asset_affected" (specific ticker e.g. "Apple (AAPL)", "Gold (GLD)"),
 - "signal_type", "direction" (bullish/bearish/neutral), "confidence" (1-10),
 - "price_target" (e.g. "+5%"), "stop_loss" (e.g. "-3%"), "time_horizon" (e.g. "2-3 days"),
 - "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note",
 - "sentiment_shift" (true/false), "sentiment_note"
 
-Only include confidence >= {MIN_SIGNAL_SCORE}. Return [] if none. JSON only, no extra text.
+Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative - fewer high quality signals is better. Return [] if none. JSON only, no extra text.
 
 TWEETS:{tweets_text}{prev_text}"""
 
@@ -182,7 +232,25 @@ TWEETS:{tweets_text}{prev_text}"""
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        return json.loads(raw.strip())
+        raw = raw.strip()
+        try:
+            return json.loads(raw)
+        except:
+            start = raw.find("[")
+            if start == -1:
+                return []
+            depth = 0
+            for i, c in enumerate(raw[start:], start):
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(raw[start:i+1])
+                        except:
+                            return []
+            return []
     except Exception as e:
         print(f"  [ERROR] Claude batch: {e}")
         return []
@@ -196,12 +264,13 @@ def send_telegram(message):
         if not chat_id:
             continue
         try:
+            safe_msg = message.replace("&", "and").replace("<", "").replace(">", "")
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "text": safe_msg, "parse_mode": "Markdown"},
                 timeout=10
             )
-            print(f"  [OK] Telegram → {chat_id}" if r.status_code == 200 else f"  [ERROR] Telegram {chat_id}: {r.text}")
+            print(f"  [OK] Telegram -> {chat_id}" if r.status_code == 200 else f"  [ERROR] Telegram {chat_id}: {r.text}")
         except Exception as e:
             print(f"  [ERROR] Telegram: {e}")
 
@@ -210,89 +279,51 @@ def send_telegram(message):
 # ============================================================
 def format_signal_alert(signal, symbol, current_price, order=None, is_conflict=False):
     emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}.get(signal.get("direction","neutral"), "⚪")
-    header = "⚠️ *CONFLICTING SIGNAL — NO TRADE*" if is_conflict else "🚨 *Market Signal Alert*"
+    header = "⚠️ CONFLICTING SIGNAL - NO TRADE" if is_conflict else "🚨 Market Signal Alert"
     price_str = f"${current_price:.2f}" if current_price else "N/A"
+
     trade_line = ""
     if order and not is_conflict:
-        side = "BUY" if signal.get("direction") == "bullish" else "SELL"
-        trade_line = f"\n📈 *Paper Trade:* {side} ${PAPER_TRADE_SIZE} of {symbol} @ {price_str}"
+        tp = order.get("legs", [{}])
+        target_pct = parse_pct(signal.get("price_target","5"), 5)
+        stop_pct = parse_pct(signal.get("stop_loss","3"), 3)
+        tp_price = round(current_price * (1 + target_pct/100), 2) if current_price else "N/A"
+        sl_price = round(current_price * (1 - stop_pct/100), 2) if current_price else "N/A"
+        trade_line = f"\n📈 Paper Trade: BUY ${PAPER_TRADE_SIZE} of {symbol} @ {price_str}\n🎯 Take Profit: ${tp_price} | 🛑 Stop Loss: ${sl_price}"
 
     msg = (
         f"{header}\n\n"
         f"👤 @{signal.get('account','?')}\n"
-        f"📌 *Asset:* {signal.get('asset_affected','?')}\n"
-        f"🔤 *Symbol:* {symbol or 'N/A'}\n"
-        f"💰 *Price:* {price_str}\n"
-        f"{emoji} *Direction:* {signal.get('direction','?').upper()}\n"
-        f"📝 *Signal:* {signal.get('tweet_summary','?')}\n\n"
-        f"🎯 *Target:* {signal.get('price_target','N/A')}\n"
-        f"🛑 *Stop Loss:* {signal.get('stop_loss','N/A')}\n"
-        f"⏱ *Hold:* {signal.get('time_horizon','N/A')}\n"
-        f"🚪 *Exit:* {signal.get('exit_trigger','N/A')}\n"
-        f"⌛ *Expires:* {signal.get('expiry','N/A')}\n"
-        f"💡 *Confidence:* {signal.get('confidence','?')}/10"
+        f"📌 Asset: {signal.get('asset_affected','?')}\n"
+        f"🔤 Symbol: {symbol or 'N/A'}\n"
+        f"💰 Price: {price_str}\n"
+        f"{emoji} Direction: {signal.get('direction','?').upper()}\n"
+        f"📝 Signal: {signal.get('tweet_summary','?')}\n\n"
+        f"🎯 Target: {signal.get('price_target','N/A')}\n"
+        f"🛑 Stop Loss: {signal.get('stop_loss','N/A')}\n"
+        f"⏱ Hold: {signal.get('time_horizon','N/A')}\n"
+        f"🚪 Exit: {signal.get('exit_trigger','N/A')}\n"
+        f"⌛ Expires: {signal.get('expiry','N/A')}\n"
+        f"💡 Confidence: {signal.get('confidence','?')}/10"
         f"{trade_line}"
     )
     if signal.get("conflicting"):
-        msg += f"\n⚠️ *Conflict:* {signal.get('conflict_note','')}"
+        msg += f"\n⚠️ Conflict: {signal.get('conflict_note','')}"
     if signal.get("sentiment_shift"):
-        msg += f"\n🔄 *Shift:* {signal.get('sentiment_note','')}"
+        msg += f"\n🔄 Shift: {signal.get('sentiment_note','')}"
     msg += f"\n🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     return msg
-
-def format_exit_alert(symbol, entry, exit_price, reason, pnl):
-    emoji = "✅" if pnl > 0 else "❌"
-    return (
-        f"{emoji} *Position Closed*\n\n"
-        f"🔤 *Symbol:* {symbol}\n"
-        f"📥 *Entry:* ${entry:.2f}\n"
-        f"📤 *Exit:* ${exit_price:.2f}\n"
-        f"📊 *P&L:* {pnl:+.2f}%\n"
-        f"💡 *Reason:* {reason}\n"
-        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
-
-# ============================================================
-# CHECK OPEN POSITIONS
-# ============================================================
-def check_open_positions():
-    if not open_positions:
-        return
-    print(f"\n[POSITIONS] Checking {len(open_positions)} open position(s)...")
-    for symbol, pos in list(open_positions.items()):
-        current_price = get_price(symbol)
-        if not current_price:
-            continue
-        entry = pos["entry_price"]
-        pnl = ((current_price - entry) / entry) * 100
-        if pos["direction"] == "bearish":
-            pnl = -pnl
-        try:
-            stop = -abs(float(pos["stop_loss_pct"].replace("%","").replace("-","")))
-            target = abs(float(pos["target_pct"].replace("%","").replace("+","")))
-        except:
-            stop, target = -3.0, 5.0
-
-        reason = None
-        if pnl <= stop:
-            reason = f"Stop loss hit ({pnl:+.2f}%)"
-        elif pnl >= target:
-            reason = f"Target reached ({pnl:+.2f}%)"
-
-        if reason:
-            if close_position(symbol):
-                send_telegram(format_exit_alert(symbol, entry, current_price, reason, pnl))
-                log_trade("EXIT", symbol, current_price, pos.get("signal", {}), result=reason)
-                del open_positions[symbol]
 
 # ============================================================
 # MAIN RUN
 # ============================================================
 def run():
-    global previous_signals, open_positions
-    print(f"\n{'='*50}\nMarket Signal Agent — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*50}")
+    global previous_signals
+    print(f"\n{'='*50}\nMarket Signal Agent - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*50}")
 
-    check_open_positions()
+    # Get REAL open positions from Alpaca (persistent across restarts)
+    open_symbols = get_open_positions()
+    print(f"\n  Open positions: {open_symbols or 'None'}")
 
     # Fetch tweets
     all_tweets = []
@@ -308,16 +339,18 @@ def run():
         return
 
     # Analyse in batches
-    print(f"\n[2/3] Analysing with Claude (batch size: {BATCH_SIZE} accounts)...")
+    print(f"\n[2/3] Analysing with Claude (batches of {BATCH_SIZE})...")
     all_signals = []
+    batch_count = -(-len(all_tweets) // (BATCH_SIZE * TWEETS_PER_ACCOUNT))
     for i in range(0, len(all_tweets), BATCH_SIZE * TWEETS_PER_ACCOUNT):
         batch = all_tweets[i:i + BATCH_SIZE * TWEETS_PER_ACCOUNT]
-        print(f"  Batch {i // (BATCH_SIZE * TWEETS_PER_ACCOUNT) + 1}/{-(-len(all_tweets) // (BATCH_SIZE * TWEETS_PER_ACCOUNT))}...")
+        batch_num = i // (BATCH_SIZE * TWEETS_PER_ACCOUNT) + 1
+        print(f"  Batch {batch_num}/{batch_count}...")
         signals = analyse_batch(batch, previous_signals)
         all_signals.extend(signals)
-        time.sleep(1)  # avoid rate limits
+        time.sleep(1)
 
-    print(f"  Total signals found: {len(all_signals)}")
+    print(f"  Total signals: {len(all_signals)}")
     if not all_signals:
         print("  No significant signals.")
         return
@@ -339,15 +372,16 @@ def run():
         sigs = [s for s in all_signals if s.get("asset_affected") == asset]
         accounts = ", ".join([f"@{s.get('account')}" for s in sigs])
         send_telegram(
-            f"⚠️ *CONFLICTING SIGNALS — DO NOT TRADE*\n\n"
-            f"📌 *Asset:* {asset}\n"
-            f"👥 *From:* {accounts}\n"
-            f"💡 Wait for clarity\n"
+            f"⚠️ CONFLICTING SIGNALS - DO NOT TRADE\n\n"
+            f"Asset: {asset}\n"
+            f"From: {accounts}\n"
+            f"Recommendation: Wait for clarity\n"
             f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         )
         print(f"  ⚠️ CONFLICT: {asset}")
 
     # Process signals
+    traded_symbols = set()  # dedupe within same run
     for signal in all_signals:
         asset = signal.get("asset_affected","")
         is_conflict = asset in conflicts
@@ -357,22 +391,28 @@ def run():
 
         if symbol and current_price and not is_conflict:
             direction = signal.get("direction","neutral")
-            if direction == "bullish":
-                order = place_paper_trade(symbol, "buy", PAPER_TRADE_SIZE)
+
+            # Only trade if not already holding AND not already traded this run
+            if direction == "bullish" and symbol not in open_symbols and symbol not in traded_symbols:
+                order = place_bracket_order(
+                    symbol,
+                    current_price,
+                    PAPER_TRADE_SIZE,
+                    signal.get("price_target", "+5%"),
+                    signal.get("stop_loss", "-3%")
+                )
                 if order:
-                    open_positions[symbol] = {
-                        "entry_price": current_price,
-                        "stop_loss_pct": signal.get("stop_loss", "-3%"),
-                        "target_pct": signal.get("price_target", "+5%"),
-                        "direction": direction,
-                        "signal": signal
-                    }
-                    log_trade("ENTRY", symbol, current_price, signal)
+                    traded_symbols.add(symbol)
+                    log_trade("ENTRY_BRACKET", symbol, current_price, signal)
+            elif symbol in open_symbols:
+                print(f"  [SKIP] {symbol} already in open positions")
+            elif symbol in traded_symbols:
+                print(f"  [SKIP] {symbol} already traded this run")
             elif direction == "bearish":
                 log_trade("SIGNAL_BEARISH", symbol, current_price, signal)
 
         price_str = f"${current_price:.2f}" if current_price else "N/A"
-        print(f"\n  → {asset} | {signal.get('direction')} | {signal.get('confidence')}/10 | {symbol} @ {price_str}")
+        print(f"\n  -> {asset} | {signal.get('direction')} | {signal.get('confidence')}/10 | {symbol} @ {price_str}")
         send_telegram(format_signal_alert(signal, symbol, current_price, order, is_conflict))
 
     # Update previous signals
