@@ -37,6 +37,7 @@ MIN_SIGNAL_SCORE = 6
 RUN_INTERVAL_HOURS = 1
 PAPER_TRADE_SIZE = 1000
 LOG_FILE = "/tmp/trades_log.csv"
+BATCH_SIZE = 5  # accounts per Claude call
 
 previous_signals = {}
 open_positions = {}
@@ -143,21 +144,23 @@ def fetch_tweets(username):
         return []
 
 # ============================================================
-# ANALYSE WITH CLAUDE
+# ANALYSE BATCH WITH CLAUDE
 # ============================================================
-def analyse_tweets(tweets_bundle, prev_signals):
-    tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_bundle])
+def analyse_batch(tweets_batch, prev_signals):
+    tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_batch])
+
     prev_text = ""
     if prev_signals:
         prev_text = "\n\nPREVIOUS SIGNALS:\n" + "\n".join([f"- {a}: {i['direction']} ({i['confidence']}/10)" for a, i in prev_signals.items()])
 
-    prompt = f"""You are an expert financial signal analyst. Analyse tweets and identify market-moving signals.
+    prompt = f"""You are an expert financial signal analyst. Analyse these tweets and identify market-moving signals.
 
 Return a JSON array where each item has:
-- "account", "tweet_summary", "asset_affected" (include ticker in parentheses e.g. "Apple (AAPL)", "Gold (GLD)"),
+- "account", "tweet_summary", "asset_affected" (include ticker e.g. "Apple (AAPL)", "Gold (GLD)"),
 - "signal_type", "direction" (bullish/bearish/neutral), "confidence" (1-10),
 - "price_target" (e.g. "+5%"), "stop_loss" (e.g. "-3%"), "time_horizon" (e.g. "2-3 days"),
-- "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note", "sentiment_shift" (true/false), "sentiment_note"
+- "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note",
+- "sentiment_shift" (true/false), "sentiment_note"
 
 Only include confidence >= {MIN_SIGNAL_SCORE}. Return [] if none. JSON only, no extra text.
 
@@ -167,17 +170,21 @@ TWEETS:{tweets_text}{prev_text}"""
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
             timeout=45
         )
-        raw = r.json()["content"][0]["text"].strip()
+        data = r.json()
+        if "content" not in data:
+            print(f"  [ERROR] Claude API: {data}")
+            return []
+        raw = data["content"][0]["text"].strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         return json.loads(raw.strip())
     except Exception as e:
-        print(f"  [ERROR] Claude: {e}")
+        print(f"  [ERROR] Claude batch: {e}")
         return []
 
 # ============================================================
@@ -287,6 +294,7 @@ def run():
 
     check_open_positions()
 
+    # Fetch tweets
     all_tweets = []
     print("\n[1/3] Fetching tweets...")
     for username in ACCOUNTS:
@@ -299,16 +307,25 @@ def run():
         print("  No tweets fetched.")
         return
 
-    print("\n[2/3] Analysing with Claude...")
-    signals = analyse_tweets(all_tweets, previous_signals)
-    print(f"  Signals found: {len(signals)}")
-    if not signals:
+    # Analyse in batches
+    print(f"\n[2/3] Analysing with Claude (batch size: {BATCH_SIZE} accounts)...")
+    all_signals = []
+    for i in range(0, len(all_tweets), BATCH_SIZE * TWEETS_PER_ACCOUNT):
+        batch = all_tweets[i:i + BATCH_SIZE * TWEETS_PER_ACCOUNT]
+        print(f"  Batch {i // (BATCH_SIZE * TWEETS_PER_ACCOUNT) + 1}/{-(-len(all_tweets) // (BATCH_SIZE * TWEETS_PER_ACCOUNT))}...")
+        signals = analyse_batch(batch, previous_signals)
+        all_signals.extend(signals)
+        time.sleep(1)  # avoid rate limits
+
+    print(f"  Total signals found: {len(all_signals)}")
+    if not all_signals:
         print("  No significant signals.")
         return
 
+    # Detect conflicts
     conflicts = set()
     asset_dirs = {}
-    for s in signals:
+    for s in all_signals:
         a = s.get("asset_affected","")
         asset_dirs.setdefault(a, []).append(s.get("direction",""))
     for a, dirs in asset_dirs.items():
@@ -316,13 +333,22 @@ def run():
             conflicts.add(a)
 
     print("\n[3/3] Processing signals...")
+
+    # Send conflict warnings
     for asset in conflicts:
-        sigs = [s for s in signals if s.get("asset_affected") == asset]
+        sigs = [s for s in all_signals if s.get("asset_affected") == asset]
         accounts = ", ".join([f"@{s.get('account')}" for s in sigs])
-        send_telegram(f"⚠️ *CONFLICTING SIGNALS — DO NOT TRADE*\n\n📌 *Asset:* {asset}\n👥 *From:* {accounts}\n💡 Wait for clarity\n🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        send_telegram(
+            f"⚠️ *CONFLICTING SIGNALS — DO NOT TRADE*\n\n"
+            f"📌 *Asset:* {asset}\n"
+            f"👥 *From:* {accounts}\n"
+            f"💡 Wait for clarity\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
         print(f"  ⚠️ CONFLICT: {asset}")
 
-    for signal in signals:
+    # Process signals
+    for signal in all_signals:
         asset = signal.get("asset_affected","")
         is_conflict = asset in conflicts
         symbol = resolve_symbol(asset)
@@ -349,7 +375,12 @@ def run():
         print(f"\n  → {asset} | {signal.get('direction')} | {signal.get('confidence')}/10 | {symbol} @ {price_str}")
         send_telegram(format_signal_alert(signal, symbol, current_price, order, is_conflict))
 
-    previous_signals = {s.get("asset_affected",""): {"direction": s.get("direction"), "confidence": s.get("confidence")} for s in signals}
+    # Update previous signals
+    previous_signals = {
+        s.get("asset_affected",""): {"direction": s.get("direction"), "confidence": s.get("confidence")}
+        for s in all_signals
+    }
+
     print(f"\n{'='*50}\nDone.")
 
 if __name__ == "__main__":
