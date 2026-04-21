@@ -2,7 +2,6 @@ import requests
 import json
 import time
 import os
-import csv
 import re
 from datetime import datetime, timezone
 
@@ -16,6 +15,21 @@ TELEGRAM_CHAT_IDS = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1or4ZytaOCJ_C6vWGG7PGIvs3iThpLfxO9FSomtTAv-I")
+
+# Google service account credentials from env
+GOOGLE_CREDENTIALS = {
+    "type": "service_account",
+    "project_id": os.environ.get("GOOGLE_PROJECT_ID", "market-agent-494020"),
+    "private_key_id": os.environ.get("GOOGLE_PRIVATE_KEY_ID", ""),
+    "private_key": os.environ.get("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
+    "client_email": os.environ.get("GOOGLE_CLIENT_EMAIL", ""),
+    "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": os.environ.get("GOOGLE_CLIENT_CERT_URL", "")
+}
 
 ACCOUNTS = [
     "elonmusk", "realDonaldTrump", "federalreserve", "jpmorgan",
@@ -36,13 +50,144 @@ TWEETS_PER_ACCOUNT = 3
 MIN_SIGNAL_SCORE = 8
 RUN_INTERVAL_HOURS = 1
 PAPER_TRADE_SIZE = 1000
-LOG_FILE = "/tmp/trades_log.csv"
 BATCH_SIZE = 5
 
 previous_signals = {}
+google_token = None
+google_token_expiry = 0
 
 # ============================================================
-# ALPACA HELPERS
+# GOOGLE SHEETS AUTH
+# ============================================================
+def get_google_token():
+    global google_token, google_token_expiry
+    now = time.time()
+    if google_token and now < google_token_expiry - 60:
+        return google_token
+    try:
+        import base64
+        import hmac
+        import hashlib
+        import struct
+
+        # Build JWT
+        header = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b'=').decode()
+        now_int = int(now)
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "iss": GOOGLE_CREDENTIALS["client_email"],
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+            "aud": "https://oauth2.googleapis.com/token",
+            "exp": now_int + 3600,
+            "iat": now_int
+        }).encode()).rstrip(b'=').decode()
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.backends import default_backend
+
+        private_key = serialization.load_pem_private_key(
+            GOOGLE_CREDENTIALS["private_key"].encode(),
+            password=None,
+            backend=default_backend()
+        )
+        signing_input = f"{header}.{payload}".encode()
+        signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+        jwt_token = f"{header}.{payload}.{sig_b64}"
+
+        r = requests.post("https://oauth2.googleapis.com/token", data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": jwt_token
+        }, timeout=10)
+        data = r.json()
+        google_token = data.get("access_token")
+        google_token_expiry = now + data.get("expires_in", 3600)
+        return google_token
+    except Exception as e:
+        print(f"  [ERROR] Google auth: {e}")
+        return None
+
+def sheets_append(sheet_name, row):
+    try:
+        token = get_google_token()
+        if not token:
+            return
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1:Z1:append?valueInputOption=USER_ENTERED"
+        r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"values": [row]}, timeout=10)
+        if r.status_code == 200:
+            print(f"  [SHEETS] Logged to {sheet_name}")
+        else:
+            print(f"  [ERROR] Sheets: {r.text}")
+    except Exception as e:
+        print(f"  [ERROR] Sheets append: {e}")
+
+def init_sheets():
+    """Create headers if sheets are empty"""
+    try:
+        token = get_google_token()
+        if not token:
+            return
+        headers_auth = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Check if Signals sheet exists and has headers
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Signals!A1"
+        r = requests.get(url, headers=headers_auth, timeout=10)
+        if not r.json().get("values"):
+            sheets_append("Signals", ["Timestamp", "Account", "Asset", "Symbol", "Direction", "Confidence", "Price", "Target", "Stop Loss", "Time Horizon", "Exit Trigger", "Expiry", "Signal Type", "Conflict", "Sentiment Shift"])
+
+        # Check Trades sheet
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Trades!A1"
+        r = requests.get(url, headers=headers_auth, timeout=10)
+        if not r.json().get("values"):
+            sheets_append("Trades", ["Timestamp", "Action", "Symbol", "Entry Price", "Take Profit Price", "Stop Loss Price", "Target %", "Stop %", "USD Amount", "Qty", "Account", "Asset", "Order ID"])
+    except Exception as e:
+        print(f"  [ERROR] Init sheets: {e}")
+
+def log_signal_to_sheets(signal, symbol, current_price):
+    try:
+        sheets_append("Signals", [
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            f"@{signal.get('account','')}",
+            signal.get("asset_affected",""),
+            symbol or "N/A",
+            signal.get("direction",""),
+            signal.get("confidence",""),
+            f"${current_price:.2f}" if current_price else "N/A",
+            signal.get("price_target",""),
+            signal.get("stop_loss",""),
+            signal.get("time_horizon",""),
+            signal.get("exit_trigger",""),
+            signal.get("expiry",""),
+            signal.get("signal_type",""),
+            "YES" if signal.get("conflicting") else "NO",
+            "YES" if signal.get("sentiment_shift") else "NO"
+        ])
+    except Exception as e:
+        print(f"  [ERROR] Log signal: {e}")
+
+def log_trade_to_sheets(symbol, entry_price, tp_price, sl_price, target_pct, stop_pct, qty, signal, order_id):
+    try:
+        sheets_append("Trades", [
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "BUY_BRACKET",
+            symbol,
+            f"${entry_price:.2f}",
+            f"${tp_price:.2f}",
+            f"${sl_price:.2f}",
+            f"+{target_pct}%",
+            f"-{stop_pct}%",
+            f"${PAPER_TRADE_SIZE}",
+            str(qty),
+            f"@{signal.get('account','')}",
+            signal.get("asset_affected",""),
+            order_id or ""
+        ])
+    except Exception as e:
+        print(f"  [ERROR] Log trade: {e}")
+
+# ============================================================
+# ALPACA
 # ============================================================
 def alpaca_headers():
     return {
@@ -63,26 +208,22 @@ def get_price(symbol):
         return None
 
 def get_open_positions():
-    """Get all currently open positions from Alpaca — persistent across restarts"""
     try:
         r = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_headers(), timeout=10)
         if r.status_code == 200:
-            positions = r.json()
-            return {p["symbol"].upper() for p in positions}
+            return {p["symbol"].upper() for p in r.json()}
         return set()
     except Exception as e:
         print(f"  [ERROR] Get positions: {e}")
         return set()
 
 def parse_pct(pct_str, default=5.0):
-    """Parse percentage strings like '+8%', '-5%', '+8-12%' -> float"""
     try:
-        clean = str(pct_str).replace("%", "").replace("+", "").strip()
-        # Handle ranges like "8-12" — take lower end
+        clean = str(pct_str).replace("%","").replace("+","").strip()
         if "-" in clean.lstrip("-"):
             parts = clean.lstrip("-").split("-")
             val = float(parts[0])
-            if pct_str.strip().startswith("-"):
+            if str(pct_str).strip().startswith("-"):
                 val = -val
         else:
             val = float(clean)
@@ -91,24 +232,18 @@ def parse_pct(pct_str, default=5.0):
         return default
 
 def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_pct_str):
-    """Place bracket order with take-profit and stop-loss built in"""
     try:
-        # Calculate quantity from dollar amount
         qty = round(usd_amount / current_price, 6)
         if qty <= 0:
-            print(f"  [ERROR] Invalid qty for {symbol}")
-            return None
+            return None, 0, 0, 0
 
-        # Calculate prices
-        target_pct = parse_pct(target_pct_str, default=5.0)
-        stop_pct = parse_pct(stop_pct_str, default=3.0)
+        target_pct = parse_pct(target_pct_str, 5.0)
+        stop_pct = parse_pct(stop_pct_str, 3.0)
+        tp_price = round(current_price * (1 + target_pct / 100), 2)
+        sl_price = round(current_price * (1 - stop_pct / 100), 2)
 
-        take_profit_price = round(current_price * (1 + target_pct / 100), 2)
-        stop_loss_price = round(current_price * (1 - stop_pct / 100), 2)
+        print(f"  [BRACKET] {symbol} qty={qty} @ ${current_price} | TP=${tp_price} | SL=${sl_price}")
 
-        print(f"  [BRACKET] {symbol} qty={qty} @ ${current_price} | TP=${take_profit_price} | SL=${stop_loss_price}")
-
-        url = f"{ALPACA_BASE_URL}/orders"
         body = {
             "symbol": symbol.upper(),
             "qty": str(qty),
@@ -116,27 +251,22 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
             "type": "market",
             "time_in_force": "gtc",
             "order_class": "bracket",
-            "take_profit": {
-                "limit_price": str(take_profit_price)
-            },
-            "stop_loss": {
-                "stop_price": str(stop_loss_price)
-            }
+            "take_profit": {"limit_price": str(tp_price)},
+            "stop_loss": {"stop_price": str(sl_price)}
         }
 
-        r = requests.post(url, headers=alpaca_headers(), json=body, timeout=10)
+        r = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_headers(), json=body, timeout=10)
         data = r.json()
 
         if r.status_code in [200, 201]:
-            print(f"  [TRADE OK] {symbol} bracket order placed — ID: {data.get('id')}")
-            return data
+            print(f"  [TRADE OK] {symbol} bracket order — ID: {data.get('id')}")
+            return data, tp_price, sl_price, qty
         else:
-            print(f"  [ERROR] Bracket order failed {symbol}: {data}")
-            return None
-
+            print(f"  [ERROR] Bracket failed {symbol}: {data}")
+            return None, tp_price, sl_price, qty
     except Exception as e:
-        print(f"  [ERROR] Bracket order: {e}")
-        return None
+        print(f"  [ERROR] Bracket: {e}")
+        return None, 0, 0, 0
 
 # ============================================================
 # SYMBOL RESOLVER
@@ -154,24 +284,6 @@ def resolve_symbol(asset_affected):
         if clean.isupper() and 1 <= len(clean) <= 5:
             return clean
     return None
-
-# ============================================================
-# TRADE LOGGER
-# ============================================================
-def log_trade(action, symbol, price, signal, result=None):
-    file_exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp","action","symbol","price","direction","confidence","price_target","stop_loss","time_horizon","account","result"])
-        writer.writerow([
-            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            action, symbol, price,
-            signal.get("direction",""), signal.get("confidence",""),
-            signal.get("price_target",""), signal.get("stop_loss",""),
-            signal.get("time_horizon",""), signal.get("account",""),
-            result or ""
-        ])
 
 # ============================================================
 # FETCH TWEETS
@@ -202,8 +314,8 @@ def analyse_batch(tweets_batch, prev_signals):
     prompt = f"""You are an expert financial signal analyst. Analyse these tweets and identify market-moving signals.
 
 STRICT RULES - only flag signals that are DIRECTLY market-moving:
-INCLUDE: earnings beats/misses, CEO changes, mergers/acquisitions, central bank decisions, war escalation with specific supply impact, regulatory actions, major macro data
-EXCLUDE: retweets of general news, social commentary, opinion posts, product demos, general AI hype, vague geopolitical commentary
+INCLUDE: earnings beats/misses, CEO changes, mergers/acquisitions, central bank decisions, war escalation with specific supply impact, regulatory actions, major macro data releases
+EXCLUDE: retweets of general news, social commentary, opinion posts, product demos, general AI hype, vague geopolitical commentary, SpaceX launches
 
 Return a JSON array where each item has:
 - "account", "tweet_summary", "asset_affected" (specific ticker e.g. "Apple (AAPL)", "Gold (GLD)"),
@@ -212,7 +324,7 @@ Return a JSON array where each item has:
 - "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note",
 - "sentiment_shift" (true/false), "sentiment_note"
 
-Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative - fewer high quality signals is better. Return [] if none. JSON only, no extra text.
+Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative. Return [] if none. JSON only, no extra text.
 
 TWEETS:{tweets_text}{prev_text}"""
 
@@ -267,7 +379,7 @@ def send_telegram(message):
             safe_msg = message.replace("&", "and").replace("<", "").replace(">", "")
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": safe_msg, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "text": safe_msg},
                 timeout=10
             )
             print(f"  [OK] Telegram -> {chat_id}" if r.status_code == 200 else f"  [ERROR] Telegram {chat_id}: {r.text}")
@@ -275,20 +387,15 @@ def send_telegram(message):
             print(f"  [ERROR] Telegram: {e}")
 
 # ============================================================
-# FORMAT ALERTS
+# FORMAT ALERT
 # ============================================================
-def format_signal_alert(signal, symbol, current_price, order=None, is_conflict=False):
+def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=None, traded=False, is_conflict=False):
     emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}.get(signal.get("direction","neutral"), "⚪")
     header = "⚠️ CONFLICTING SIGNAL - NO TRADE" if is_conflict else "🚨 Market Signal Alert"
     price_str = f"${current_price:.2f}" if current_price else "N/A"
 
     trade_line = ""
-    if order and not is_conflict:
-        tp = order.get("legs", [{}])
-        target_pct = parse_pct(signal.get("price_target","5"), 5)
-        stop_pct = parse_pct(signal.get("stop_loss","3"), 3)
-        tp_price = round(current_price * (1 + target_pct/100), 2) if current_price else "N/A"
-        sl_price = round(current_price * (1 - stop_pct/100), 2) if current_price else "N/A"
+    if traded and tp_price and sl_price:
         trade_line = f"\n📈 Paper Trade: BUY ${PAPER_TRADE_SIZE} of {symbol} @ {price_str}\n🎯 Take Profit: ${tp_price} | 🛑 Stop Loss: ${sl_price}"
 
     msg = (
@@ -321,11 +428,9 @@ def run():
     global previous_signals
     print(f"\n{'='*50}\nMarket Signal Agent - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*50}")
 
-    # Get REAL open positions from Alpaca (persistent across restarts)
     open_symbols = get_open_positions()
     print(f"\n  Open positions: {open_symbols or 'None'}")
 
-    # Fetch tweets
     all_tweets = []
     print("\n[1/3] Fetching tweets...")
     for username in ACCOUNTS:
@@ -338,14 +443,12 @@ def run():
         print("  No tweets fetched.")
         return
 
-    # Analyse in batches
     print(f"\n[2/3] Analysing with Claude (batches of {BATCH_SIZE})...")
     all_signals = []
     batch_count = -(-len(all_tweets) // (BATCH_SIZE * TWEETS_PER_ACCOUNT))
     for i in range(0, len(all_tweets), BATCH_SIZE * TWEETS_PER_ACCOUNT):
         batch = all_tweets[i:i + BATCH_SIZE * TWEETS_PER_ACCOUNT]
-        batch_num = i // (BATCH_SIZE * TWEETS_PER_ACCOUNT) + 1
-        print(f"  Batch {batch_num}/{batch_count}...")
+        print(f"  Batch {i//(BATCH_SIZE*TWEETS_PER_ACCOUNT)+1}/{batch_count}...")
         signals = analyse_batch(batch, previous_signals)
         all_signals.extend(signals)
         time.sleep(1)
@@ -367,55 +470,45 @@ def run():
 
     print("\n[3/3] Processing signals...")
 
-    # Send conflict warnings
     for asset in conflicts:
         sigs = [s for s in all_signals if s.get("asset_affected") == asset]
         accounts = ", ".join([f"@{s.get('account')}" for s in sigs])
-        send_telegram(
-            f"⚠️ CONFLICTING SIGNALS - DO NOT TRADE\n\n"
-            f"Asset: {asset}\n"
-            f"From: {accounts}\n"
-            f"Recommendation: Wait for clarity\n"
-            f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-        print(f"  ⚠️ CONFLICT: {asset}")
+        send_telegram(f"⚠️ CONFLICTING SIGNALS - DO NOT TRADE\n\nAsset: {asset}\nFrom: {accounts}\nRecommendation: Wait for clarity\n🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-    # Process signals
-    traded_symbols = set()  # dedupe within same run
+    traded_symbols = set()
     for signal in all_signals:
         asset = signal.get("asset_affected","")
         is_conflict = asset in conflicts
         symbol = resolve_symbol(asset)
         current_price = get_price(symbol) if symbol else None
-        order = None
+
+        # Log every signal to Google Sheets
+        log_signal_to_sheets(signal, symbol, current_price)
+
+        order, tp_price, sl_price, qty = None, None, None, 0
 
         if symbol and current_price and not is_conflict:
             direction = signal.get("direction","neutral")
-
-            # Only trade if not already holding AND not already traded this run
             if direction == "bullish" and symbol not in open_symbols and symbol not in traded_symbols:
-                order = place_bracket_order(
-                    symbol,
-                    current_price,
-                    PAPER_TRADE_SIZE,
-                    signal.get("price_target", "+5%"),
-                    signal.get("stop_loss", "-3%")
+                target_pct_str = signal.get("price_target", "+5%")
+                stop_pct_str = signal.get("stop_loss", "-3%")
+                order, tp_price, sl_price, qty = place_bracket_order(
+                    symbol, current_price, PAPER_TRADE_SIZE, target_pct_str, stop_pct_str
                 )
                 if order:
                     traded_symbols.add(symbol)
-                    log_trade("ENTRY_BRACKET", symbol, current_price, signal)
+                    log_trade_to_sheets(symbol, current_price, tp_price, sl_price,
+                                       parse_pct(target_pct_str), parse_pct(stop_pct_str),
+                                       qty, signal, order.get("id"))
             elif symbol in open_symbols:
-                print(f"  [SKIP] {symbol} already in open positions")
+                print(f"  [SKIP] {symbol} already open")
             elif symbol in traded_symbols:
                 print(f"  [SKIP] {symbol} already traded this run")
-            elif direction == "bearish":
-                log_trade("SIGNAL_BEARISH", symbol, current_price, signal)
 
         price_str = f"${current_price:.2f}" if current_price else "N/A"
         print(f"\n  -> {asset} | {signal.get('direction')} | {signal.get('confidence')}/10 | {symbol} @ {price_str}")
-        send_telegram(format_signal_alert(signal, symbol, current_price, order, is_conflict))
+        send_telegram(format_signal_alert(signal, symbol, current_price, tp_price, sl_price, order is not None, is_conflict))
 
-    # Update previous signals
     previous_signals = {
         s.get("asset_affected",""): {"direction": s.get("direction"), "confidence": s.get("confidence")}
         for s in all_signals
@@ -424,6 +517,7 @@ def run():
     print(f"\n{'='*50}\nDone.")
 
 if __name__ == "__main__":
+    init_sheets()
     while True:
         run()
         print(f"\nSleeping {RUN_INTERVAL_HOURS} hour(s)...\n")
