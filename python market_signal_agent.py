@@ -39,7 +39,7 @@ TWEETS_PER_ACCOUNT = 3
 MIN_SIGNAL_SCORE = 8
 RUN_INTERVAL_HOURS = 1
 PAPER_TRADE_SIZE = 1000
-BATCH_SIZE = 5
+BATCH_SIZE = 10
 
 previous_signals = {}
 gspread_client = None
@@ -68,13 +68,18 @@ def sheets_append(sheet_name, row):
     try:
         client = get_sheets_client()
         if not client:
+            print(f"  [ERROR] Sheets append: no client")
             return
         sheet = client.open_by_key(GOOGLE_SHEET_ID)
         worksheet = sheet.worksheet(sheet_name)
-        worksheet.append_row(row)
+        # Convert all values to strings to avoid type errors
+        safe_row = [str(v) if v is not None else "" for v in row]
+        worksheet.append_row(safe_row, value_input_option="USER_ENTERED")
         print(f"  [SHEETS] Logged to {sheet_name}")
     except Exception as e:
-        print(f"  [ERROR] Sheets append: {e}")
+        import traceback
+        print(f"  [ERROR] Sheets append ({sheet_name}): {e}")
+        print(f"  [ERROR] Traceback: {traceback.format_exc()[:200]}")
 
 def init_sheets():
     try:
@@ -101,7 +106,8 @@ def init_sheets():
         
         print("  [SHEETS] Sheets initialized")
     except Exception as e:
-        print(f"  [ERROR] Init sheets: {e}")
+        import traceback
+        print(f"  [ERROR] Init sheets: {e} | {traceback.format_exc()[:300]}")
 
 def log_signal_to_sheets(signal, symbol, current_price):
     try:
