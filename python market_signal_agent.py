@@ -42,72 +42,94 @@ PAPER_TRADE_SIZE = 1000
 BATCH_SIZE = 10
 
 previous_signals = {}
-gspread_client = None
+sheets_token = None
+sheets_token_expiry = 0
 
 # ============================================================
-# GOOGLE SHEETS (using gspread)
+# GOOGLE SHEETS (raw REST API - no gspread)
 # ============================================================
-def get_sheets_client():
-    global gspread_client
-    if gspread_client:
-        return gspread_client
+def get_sheets_token():
+    global sheets_token, sheets_token_expiry
+    now = time.time()
+    if sheets_token and now < sheets_token_expiry - 60:
+        return sheets_token
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gspread_client = gspread.authorize(creds)
-        print("  [SHEETS] Connected to Google Sheets")
-        return gspread_client
+        import base64
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.backends import default_backend
+
+        creds = json.loads(GOOGLE_CREDENTIALS_JSON)
+        now_int = int(now)
+
+        header = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "iss": creds["client_email"],
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+            "aud": "https://oauth2.googleapis.com/token",
+            "exp": now_int + 3600,
+            "iat": now_int
+        }).encode()).rstrip(b"=").decode()
+
+        key = serialization.load_pem_private_key(
+            creds["private_key"].encode(), password=None, backend=default_backend()
+        )
+        sig = key.sign(f"{header}.{payload}".encode(), padding.PKCS1v15(), hashes.SHA256())
+        sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+        jwt = f"{header}.{payload}.{sig_b64}"
+
+        r = requests.post("https://oauth2.googleapis.com/token", data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": jwt
+        }, timeout=10)
+        data = r.json()
+        sheets_token = data.get("access_token")
+        sheets_token_expiry = now + data.get("expires_in", 3600)
+        if sheets_token:
+            print("  [SHEETS] Connected to Google Sheets")
+        return sheets_token
     except Exception as e:
-        print(f"  [ERROR] Google Sheets client: {e}")
+        print(f"  [ERROR] Sheets auth: {e}")
         return None
 
 def sheets_append(sheet_name, row):
     try:
-        client = get_sheets_client()
-        if not client:
-            print(f"  [ERROR] Sheets append: no client")
+        token = get_sheets_token()
+        if not token:
             return
-        sheet = client.open_by_key(GOOGLE_SHEET_ID)
-        worksheet = sheet.worksheet(sheet_name)
-        # Convert all values to strings to avoid type errors
         safe_row = [str(v) if v is not None else "" for v in row]
-        worksheet.append_row(safe_row, value_input_option="USER_ENTERED")
-        print(f"  [SHEETS] Logged to {sheet_name}")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        r = requests.post(url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"values": [safe_row]},
+            timeout=15
+        )
+        if r.status_code == 200:
+            print(f"  [SHEETS] Logged to {sheet_name}")
+        else:
+            print(f"  [ERROR] Sheets {sheet_name}: {r.status_code} {r.text[:100]}")
     except Exception as e:
-        import traceback
-        print(f"  [ERROR] Sheets append ({sheet_name}): {e}")
-        print(f"  [ERROR] Traceback: {traceback.format_exc()[:200]}")
+        print(f"  [ERROR] Sheets append: {e}")
 
 def init_sheets():
     try:
-        client = get_sheets_client()
-        if not client:
+        token = get_sheets_token()
+        if not token:
             return
-        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         
-        # Init Signals sheet
-        try:
-            ws = sheet.worksheet("Signals")
-        except:
-            ws = sheet.add_worksheet("Signals", 1000, 20)
-        if not ws.row_values(1):
-            ws.append_row(["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"])
-
-        # Init Trades sheet
-        try:
-            ws2 = sheet.worksheet("Trades")
-        except:
-            ws2 = sheet.add_worksheet("Trades", 1000, 20)
-        if not ws2.row_values(1):
-            ws2.append_row(["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"])
+        for sheet_name, cols in [
+            ("Signals", ["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"]),
+            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"])
+        ]:
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1"
+            r = requests.get(url, headers=headers, timeout=10)
+            if not r.json().get("values"):
+                sheets_append(sheet_name, cols)
         
         print("  [SHEETS] Sheets initialized")
     except Exception as e:
-        import traceback
-        print(f"  [ERROR] Init sheets: {e} | {traceback.format_exc()[:300]}")
+        print(f"  [ERROR] Init sheets: {e}")
 
 def log_signal_to_sheets(signal, symbol, current_price):
     try:
