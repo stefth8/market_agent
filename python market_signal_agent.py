@@ -17,19 +17,8 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1or4ZytaOCJ_C6vWGG7PGIvs3iThpLfxO9FSomtTAv-I")
 
-# Google service account credentials from env
-GOOGLE_CREDENTIALS = {
-    "type": "service_account",
-    "project_id": os.environ.get("GOOGLE_PROJECT_ID", "market-agent-494020"),
-    "private_key_id": os.environ.get("GOOGLE_PRIVATE_KEY_ID", ""),
-    "private_key": os.environ.get("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n"),
-    "client_email": os.environ.get("GOOGLE_CLIENT_EMAIL", ""),
-    "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": os.environ.get("GOOGLE_CLIENT_CERT_URL", "")
-}
+# Google credentials loaded from single JSON env variable
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "{}")
 
 ACCOUNTS = [
     "elonmusk", "realDonaldTrump", "federalreserve", "jpmorgan",
@@ -53,94 +42,64 @@ PAPER_TRADE_SIZE = 1000
 BATCH_SIZE = 5
 
 previous_signals = {}
-google_token = None
-google_token_expiry = 0
+gspread_client = None
 
 # ============================================================
-# GOOGLE SHEETS AUTH
+# GOOGLE SHEETS (using gspread)
 # ============================================================
-def get_google_token():
-    global google_token, google_token_expiry
-    now = time.time()
-    if google_token and now < google_token_expiry - 60:
-        return google_token
+def get_sheets_client():
+    global gspread_client
+    if gspread_client:
+        return gspread_client
     try:
-        import base64
-        import hmac
-        import hashlib
-        import struct
-
-        # Build JWT
-        header = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b'=').decode()
-        now_int = int(now)
-        payload = base64.urlsafe_b64encode(json.dumps({
-            "iss": GOOGLE_CREDENTIALS["client_email"],
-            "scope": "https://www.googleapis.com/auth/spreadsheets",
-            "aud": "https://oauth2.googleapis.com/token",
-            "exp": now_int + 3600,
-            "iat": now_int
-        }).encode()).rstrip(b'=').decode()
-
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-        from cryptography.hazmat.backends import default_backend
-
-        private_key = serialization.load_pem_private_key(
-            GOOGLE_CREDENTIALS["private_key"].encode(),
-            password=None,
-            backend=default_backend()
-        )
-        signing_input = f"{header}.{payload}".encode()
-        signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-        sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
-        jwt_token = f"{header}.{payload}.{sig_b64}"
-
-        r = requests.post("https://oauth2.googleapis.com/token", data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": jwt_token
-        }, timeout=10)
-        data = r.json()
-        google_token = data.get("access_token")
-        google_token_expiry = now + data.get("expires_in", 3600)
-        return google_token
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gspread_client = gspread.authorize(creds)
+        print("  [SHEETS] Connected to Google Sheets")
+        return gspread_client
     except Exception as e:
-        print(f"  [ERROR] Google auth: {e}")
+        print(f"  [ERROR] Google Sheets client: {e}")
         return None
 
 def sheets_append(sheet_name, row):
     try:
-        token = get_google_token()
-        if not token:
+        client = get_sheets_client()
+        if not client:
             return
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1:Z1:append?valueInputOption=USER_ENTERED"
-        r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"values": [row]}, timeout=10)
-        if r.status_code == 200:
-            print(f"  [SHEETS] Logged to {sheet_name}")
-        else:
-            print(f"  [ERROR] Sheets: {r.text}")
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = sheet.worksheet(sheet_name)
+        worksheet.append_row(row)
+        print(f"  [SHEETS] Logged to {sheet_name}")
     except Exception as e:
         print(f"  [ERROR] Sheets append: {e}")
 
 def init_sheets():
-    """Create headers if sheets are empty"""
     try:
-        token = get_google_token()
-        if not token:
+        client = get_sheets_client()
+        if not client:
             return
-        headers_auth = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        
+        # Init Signals sheet
+        try:
+            ws = sheet.worksheet("Signals")
+        except:
+            ws = sheet.add_worksheet("Signals", 1000, 20)
+        if not ws.row_values(1):
+            ws.append_row(["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"])
 
-        # Check if Signals sheet exists and has headers
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Signals!A1"
-        r = requests.get(url, headers=headers_auth, timeout=10)
-        if not r.json().get("values"):
-            sheets_append("Signals", ["Timestamp", "Account", "Asset", "Symbol", "Direction", "Confidence", "Price", "Target", "Stop Loss", "Time Horizon", "Exit Trigger", "Expiry", "Signal Type", "Conflict", "Sentiment Shift"])
-
-        # Check Trades sheet
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Trades!A1"
-        r = requests.get(url, headers=headers_auth, timeout=10)
-        if not r.json().get("values"):
-            sheets_append("Trades", ["Timestamp", "Action", "Symbol", "Entry Price", "Take Profit Price", "Stop Loss Price", "Target %", "Stop %", "USD Amount", "Qty", "Account", "Asset", "Order ID"])
+        # Init Trades sheet
+        try:
+            ws2 = sheet.worksheet("Trades")
+        except:
+            ws2 = sheet.add_worksheet("Trades", 1000, 20)
+        if not ws2.row_values(1):
+            ws2.append_row(["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"])
+        
+        print("  [SHEETS] Sheets initialized")
     except Exception as e:
         print(f"  [ERROR] Init sheets: {e}")
 
