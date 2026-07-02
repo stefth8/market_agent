@@ -135,7 +135,7 @@ def log_signal_to_sheets(signal, symbol, current_price):
     try:
         sheets_append("Signals", [
             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            f"@{signal.get('account','')}",
+            f"@{str(signal.get('account','')).lstrip('@')}",
             signal.get("asset_affected",""),
             symbol or "N/A",
             signal.get("direction",""),
@@ -166,7 +166,7 @@ def log_trade_to_sheets(symbol, entry_price, tp_price, sl_price, target_pct, sto
             f"-{stop_pct}%",
             f"${PAPER_TRADE_SIZE}",
             str(qty),
-            f"@{signal.get('account','')}",
+            f"@{str(signal.get('account','')).lstrip('@')}",
             signal.get("asset_affected",""),
             order_id or ""
         ])
@@ -283,6 +283,9 @@ def fetch_tweets(username):
             params={"userName": username, "count": TWEETS_PER_ACCOUNT},
             timeout=10
         )
+        if r.status_code in (401, 403):
+            print(f"  [ERROR] @{username}: auth failed HTTP {r.status_code} {r.text[:200]}")
+            return []
         tweets = r.json().get("data", {}).get("tweets", [])
         return [{"id": t.get("id",""), "text": t.get("text",""), "created_at": t.get("createdAt",""), "username": username} for t in tweets]
     except Exception as e:
@@ -311,6 +314,8 @@ Return a JSON array where each item has:
 - "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note",
 - "sentiment_shift" (true/false), "sentiment_note"
 
+Calculate "expiry" as an absolute date/time (e.g. "2026-07-05 14:30 UTC") measured from THAT tweet's own created_at timestamp shown in parentheses next to it, by adding the time_horizon. Do NOT use today's date or any arbitrary date.
+
 Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative. Return [] if none. JSON only, no extra text.
 
 TWEETS:{tweets_text}{prev_text}"""
@@ -319,7 +324,7 @@ TWEETS:{tweets_text}{prev_text}"""
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
             timeout=45
         )
         data = r.json()
@@ -385,9 +390,10 @@ def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=N
     if traded and tp_price and sl_price:
         trade_line = f"\n📈 Paper Trade: BUY ${PAPER_TRADE_SIZE} of {symbol} @ {price_str}\n🎯 Take Profit: ${tp_price} | 🛑 Stop Loss: ${sl_price}"
 
+    account = str(signal.get('account','?')).lstrip('@')
     msg = (
         f"{header}\n\n"
-        f"👤 @{signal.get('account','?')}\n"
+        f"👤 @{account}\n"
         f"📌 Asset: {signal.get('asset_affected','?')}\n"
         f"🔤 Symbol: {symbol or 'N/A'}\n"
         f"💰 Price: {price_str}\n"
@@ -459,7 +465,7 @@ def run():
 
     for asset in conflicts:
         sigs = [s for s in all_signals if s.get("asset_affected") == asset]
-        accounts = ", ".join([f"@{s.get('account')}" for s in sigs])
+        accounts = ", ".join([f"@{str(s.get('account','')).lstrip('@')}" for s in sigs])
         send_telegram(f"⚠️ CONFLICTING SIGNALS - DO NOT TRADE\n\nAsset: {asset}\nFrom: {accounts}\nRecommendation: Wait for clarity\n🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     traded_symbols = set()
