@@ -42,6 +42,7 @@ PAPER_TRADE_SIZE = 1000
 BATCH_SIZE = 10
 
 previous_signals = {}
+last_seen_ids = {}   # username -> newest tweet id seen so far (high-water mark, in-memory for the process life)
 sheets_token = None
 sheets_token_expiry = 0
 
@@ -286,8 +287,30 @@ def fetch_tweets(username):
         if r.status_code in (401, 403):
             print(f"  [ERROR] @{username}: auth failed HTTP {r.status_code} {r.text[:200]}")
             return []
-        tweets = r.json().get("data", {}).get("tweets", [])
-        return [{"id": t.get("id",""), "text": t.get("text",""), "created_at": t.get("createdAt",""), "username": username} for t in tweets]
+        raw = r.json().get("data", {}).get("tweets", [])
+        tweets = [{"id": t.get("id",""), "text": t.get("text",""), "created_at": t.get("createdAt",""), "username": username} for t in raw]
+        if not tweets:
+            return []
+
+        # Twitter IDs are snowflake integers (monotonically increasing), so the largest id is the
+        # newest. Only keep tweets strictly newer than the high-water mark from the previous run.
+        def as_int(tid):
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                return -1
+
+        last_seen = last_seen_ids.get(username)
+        newest_id = max((t["id"] for t in tweets), key=as_int)
+
+        if last_seen is None:
+            new_tweets = tweets  # first time this account is seen this process — everything is new
+        else:
+            new_tweets = [t for t in tweets if as_int(t["id"]) > as_int(last_seen)]
+
+        if newest_id:
+            last_seen_ids[username] = newest_id
+        return new_tweets
     except Exception as e:
         print(f"  [ERROR] @{username}: {e}")
         return []
@@ -435,13 +458,20 @@ def run():
     print(f"\n  Open positions: {open_symbols or 'None'}")
 
     all_tweets = []
+    active, skipped = 0, 0
     print("\n[1/3] Fetching tweets...")
     for username in ACCOUNTS:
         print(f"  Fetching @{username}...")
-        all_tweets.extend(fetch_tweets(username))
+        new_tweets = fetch_tweets(username)
+        if new_tweets:
+            active += 1
+            all_tweets.extend(new_tweets)
+        else:
+            skipped += 1  # no new tweets since last run (or fetch error) — not sent to Claude
         time.sleep(0.5)
 
-    print(f"\n  Total tweets: {len(all_tweets)}")
+    print(f"\n  Accounts with new tweets: {active} | skipped (no new / error): {skipped}")
+    print(f"  Total tweets: {len(all_tweets)}")
     if not all_tweets:
         print("  No tweets fetched.")
         return
