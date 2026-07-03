@@ -13,7 +13,9 @@
       "Bash(railway link *)",
       "Bash(railway service *)",
       "Bash(kill %1)",
-      "Skill(claude-api)"
+      "Skill(claude-api)",
+      "Bash(timeout 25 railway logs)",
+      "Bash(railway logs *)"
     ]
   }
 }
