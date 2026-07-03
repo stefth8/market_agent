@@ -295,13 +295,9 @@ def fetch_tweets(username):
 # ============================================================
 # ANALYSE WITH CLAUDE
 # ============================================================
-def analyse_batch(tweets_batch, prev_signals):
-    tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_batch])
-    prev_text = ""
-    if prev_signals:
-        prev_text = "\n\nPREVIOUS SIGNALS:\n" + "\n".join([f"- {a}: {i['direction']} ({i['confidence']}/10)" for a, i in prev_signals.items()])
-
-    prompt = f"""You are an expert financial signal analyst. Analyse these tweets and identify market-moving signals.
+# Static instruction text — byte-identical across every batch call so it can be cached.
+# Kept out of analyse_batch() so nothing volatile (tweets, timestamps) leaks into the prefix.
+SIGNAL_INSTRUCTIONS = f"""You are an expert financial signal analyst. Analyse these tweets and identify market-moving signals.
 
 STRICT RULES - only flag signals that are DIRECTLY market-moving:
 INCLUDE: earnings beats/misses, CEO changes, mergers/acquisitions, central bank decisions, war escalation with specific supply impact, regulatory actions, major macro data releases
@@ -316,15 +312,29 @@ Return a JSON array where each item has:
 
 Calculate "expiry" as an absolute date/time (e.g. "2026-07-05 14:30 UTC") measured from THAT tweet's own created_at timestamp shown in parentheses next to it, by adding the time_horizon. Do NOT use today's date or any arbitrary date.
 
-Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative. Return [] if none. JSON only, no extra text.
+Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative. Return [] if none. JSON only, no extra text."""
 
-TWEETS:{tweets_text}{prev_text}"""
+def analyse_batch(tweets_batch, prev_signals):
+    tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_batch])
+    prev_text = ""
+    if prev_signals:
+        prev_text = "\n\nPREVIOUS SIGNALS:\n" + "\n".join([f"- {a}: {i['direction']} ({i['confidence']}/10)" for a, i in prev_signals.items()])
+
+    # Only the volatile tweet content goes in the user turn; the cached instructions live in `system`.
+    user_content = f"TWEETS:{tweets_text}{prev_text}"
 
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1500,
+                "system": [
+                    {"type": "text", "text": SIGNAL_INSTRUCTIONS, "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [{"role": "user", "content": user_content}]
+            },
             timeout=45
         )
         data = r.json()

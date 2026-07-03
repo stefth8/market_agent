@@ -8,7 +8,12 @@
       "Bash(railway variables *)",
       "Bash(export *)",
       "Bash(env TWITTER_API_KEY=new1_80aa4e06ab134dbc971e5abe67d010b0 *)",
-      "Bash(env TWITTER_API_KEY=new1_c6eeea4db0f64bd29c9baf40198a65f9 *)"
+      "Bash(env TWITTER_API_KEY=new1_c6eeea4db0f64bd29c9baf40198a65f9 *)",
+      "Bash(railway list *)",
+      "Bash(railway link *)",
+      "Bash(railway service *)",
+      "Bash(kill %1)",
+      "Skill(claude-api)"
     ]
   }
 }
