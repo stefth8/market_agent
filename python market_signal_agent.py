@@ -236,6 +236,9 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
         live_price = get_price(symbol) or current_price
         if tp_price <= live_price + 0.01:
             tp_price = round(live_price + 0.02, 2)
+        # Mirror guard for the stop: Alpaca requires the stop below the current base price.
+        if sl_price >= live_price - 0.01:
+            sl_price = round(live_price - 0.02, 2)
 
         print(f"  [BRACKET] {symbol} qty={qty} @ ${current_price} | TP=${tp_price} | SL=${sl_price}")
 

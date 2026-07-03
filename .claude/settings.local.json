@@ -15,7 +15,12 @@
       "Bash(kill %1)",
       "Skill(claude-api)",
       "Bash(timeout 25 railway logs)",
-      "Bash(railway logs *)"
+      "Bash(railway logs *)",
+      "Bash(git diff *)",
+      "Bash(git --no-pager diff -U2 -- \"python market_signal_agent.py\")",
+      "Bash(git --no-pager log --oneline -5)",
+      "Bash(git --no-pager diff ef6bcb7 -- \"python market_signal_agent.py\")",
+      "Bash(git --no-pager diff -U3 -- \"python market_signal_agent.py\")"
     ]
   }
 }
