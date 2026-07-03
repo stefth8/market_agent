@@ -230,6 +230,13 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
         tp_price = round(current_price * (1 + target_pct / 100), 2)
         sl_price = round(current_price * (1 - stop_pct / 100), 2)
 
+        # Re-check the live price before submitting — it may have moved since the quote.
+        # Alpaca rejects a bracket take-profit that isn't strictly above the current base price,
+        # so bump tp_price above that floor when the market has caught up to it.
+        live_price = get_price(symbol) or current_price
+        if tp_price <= live_price + 0.01:
+            tp_price = round(live_price + 0.02, 2)
+
         print(f"  [BRACKET] {symbol} qty={qty} @ ${current_price} | TP=${tp_price} | SL=${sl_price}")
 
         body = {
@@ -237,7 +244,7 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
             "qty": str(qty),
             "side": "buy",
             "type": "market",
-            "time_in_force": "gtc",
+            "time_in_force": "day",
             "order_class": "bracket",
             "take_profit": {"limit_price": str(tp_price)},
             "stop_loss": {"stop_price": str(sl_price)}
