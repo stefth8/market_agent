@@ -43,6 +43,7 @@ BATCH_SIZE = 10
 
 previous_signals = {}
 last_seen_ids = {}   # username -> newest tweet id seen so far (high-water mark, in-memory for the process life)
+previous_open_positions = set()   # symbols open at the previous cycle; in-memory only (resets on restart)
 sheets_token = None
 sheets_token_expiry = 0
 
@@ -121,7 +122,7 @@ def init_sheets():
         
         for sheet_name, cols in [
             ("Signals", ["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"]),
-            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"]),
+            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID","Close Status","Exit Price","Exit Reason","P&L %","Closed At"]),
             ("Outcomes", ["Signal Timestamp","Account","Symbol","Direction","Confidence","Entry Price","Target Price","Stop Price","Outcome","Price at Check","Actual % Move","Checked At"])
         ]:
             url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1"
@@ -147,6 +148,28 @@ def sheets_read(sheet_name):
     except Exception as e:
         print(f"  [ERROR] Sheets read {sheet_name}: {e}")
         return []
+
+def sheets_update(a1_range, row):
+    """Overwrite a specific A1 range (e.g. 'Trades!N5:R5') in place — used to update, not append."""
+    try:
+        token = get_sheets_token()
+        if not token:
+            return False
+        safe_row = [str(v) if v is not None else "" for v in row]
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{a1_range}?valueInputOption=USER_ENTERED"
+        r = requests.put(url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"values": [safe_row]},
+            timeout=15
+        )
+        if r.status_code == 200:
+            print(f"  [SHEETS] Updated {a1_range}")
+            return True
+        print(f"  [ERROR] Sheets update {a1_range}: {r.status_code} {r.text[:100]}")
+        return False
+    except Exception as e:
+        print(f"  [ERROR] Sheets update: {e}")
+        return False
 
 # ============================================================
 # OUTCOME TRACKING
@@ -254,6 +277,90 @@ def check_outcomes():
         print(f"  [OUTCOMES] Checked {checked} newly-expired signal(s)")
     except Exception as e:
         print(f"  [ERROR] Outcomes: {e}")
+
+# ============================================================
+# POSITION CLOSE DETECTION
+# ============================================================
+def _handle_closed_position(symbol):
+    # (a) Pull recent closed orders for this symbol (most recent first).
+    r = requests.get(
+        f"{ALPACA_BASE_URL}/orders",
+        headers=alpaca_headers(),
+        params={"symbols": symbol, "status": "closed", "limit": 10, "direction": "desc"},
+        timeout=10
+    )
+    if r.status_code != 200:
+        print(f"  [ERROR] Close orders {symbol}: {r.status_code} {r.text[:120]}")
+        return
+    orders = r.json()
+
+    # (b) Most recent FILLED sell bracket leg — the exit, not the original entry buy.
+    exit_order = None
+    for o in orders:
+        if (o.get("side") == "sell" and o.get("order_class") == "bracket"
+                and o.get("status") == "filled" and o.get("filled_avg_price")):
+            exit_order = o
+            break  # list is desc — first match is the most recent
+    if not exit_order:
+        print(f"  [CLOSE] {symbol} closed but no filled sell bracket leg found — skipping")
+        return
+
+    # (c) Exit reason from the order type.
+    otype = exit_order.get("type", "")
+    if otype == "limit":
+        reason = "Take-Profit Hit"
+    elif otype in ("stop", "stop_limit"):
+        reason = "Stop-Loss Hit"
+    else:
+        reason = "Closed"
+    exit_price = float(exit_order.get("filled_avg_price"))
+
+    # (d) Match the open Trades row for this symbol (most recent one with no close status).
+    row_num, entry_price = None, None
+    trades = sheets_read("Trades")
+    for i, t in enumerate(trades):
+        if i == 0 or len(t) < 4:
+            continue  # header / malformed
+        # Trades col C(2)=Symbol, D(3)=Entry Price, N(13)=Close Status
+        if t[2].strip().upper() == symbol.upper() and (len(t) <= 13 or not t[13].strip()):
+            row_num = i + 1            # 1-based sheet row (row 1 is the header)
+            entry_price = _parse_price(t[3])
+    if row_num is None:
+        print(f"  [CLOSE] {symbol} no open Trades row found — will notify without row update")
+
+    # (e) P&L (long-only bot; short-side logic intentionally skipped).
+    pnl = (exit_price - entry_price) / entry_price * 100 if entry_price else None
+    pnl_str = f"{pnl:+.2f}%" if pnl is not None else "N/A"
+
+    # (3) Telegram notification.
+    send_telegram(f"✅ Position Closed: {symbol} | Exit: ${exit_price:.2f} | Reason: {reason} | P&L: {pnl_str}")
+
+    # (4) Update the matching Trades row in place (Close Status, Exit Price, Exit Reason, P&L %, Closed At).
+    if row_num is not None:
+        closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        sheets_update(f"Trades!N{row_num}:R{row_num}",
+                      ["CLOSED", f"${exit_price:.2f}", reason, pnl_str, closed_at])
+    print(f"  [CLOSE] {symbol} {reason} exit ${exit_price:.2f} P&L {pnl_str}")
+
+def check_closed_positions(current_open):
+    """Detect positions that closed since the previous cycle, notify, and update the Trades row.
+    Wrapped so any failure never blocks the main signal/trade flow."""
+    global previous_open_positions
+    try:
+        closed = previous_open_positions - set(current_open)
+        if closed:
+            print(f"  [CLOSE] Detected {len(closed)} closed position(s): {', '.join(sorted(closed))}")
+        for symbol in sorted(closed):
+            try:
+                _handle_closed_position(symbol)
+            except Exception as e:
+                print(f"  [ERROR] Close handling {symbol}: {e}")
+    except Exception as e:
+        print(f"  [ERROR] Close detection: {e}")
+    finally:
+        # Reset the baseline for the next cycle. Done here (not literally at run() end) so an
+        # early return in run() can't leave it stale and re-fire duplicate close alerts.
+        previous_open_positions = set(current_open)
 
 def log_signal_to_sheets(signal, symbol, current_price):
     try:
@@ -614,6 +721,7 @@ def run():
 
     open_symbols = get_open_positions()
     print(f"\n  Open positions: {open_symbols or 'None'}")
+    check_closed_positions(open_symbols)
 
     all_tweets = []
     active, skipped = 0, 0
