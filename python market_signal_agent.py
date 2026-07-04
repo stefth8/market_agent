@@ -121,16 +121,139 @@ def init_sheets():
         
         for sheet_name, cols in [
             ("Signals", ["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"]),
-            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"])
+            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID"]),
+            ("Outcomes", ["Signal Timestamp","Account","Symbol","Direction","Confidence","Entry Price","Target Price","Stop Price","Outcome","Price at Check","Actual % Move","Checked At"])
         ]:
             url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1"
             r = requests.get(url, headers=headers, timeout=10)
             if not r.json().get("values"):
                 sheets_append(sheet_name, cols)
-        
+
         print("  [SHEETS] Sheets initialized")
     except Exception as e:
         print(f"  [ERROR] Init sheets: {e}")
+
+def sheets_read(sheet_name):
+    try:
+        token = get_sheets_token()
+        if not token:
+            return []
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}"
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("values", [])
+        # A missing tab returns 400 — treat as no rows rather than raising.
+        return []
+    except Exception as e:
+        print(f"  [ERROR] Sheets read {sheet_name}: {e}")
+        return []
+
+# ============================================================
+# OUTCOME TRACKING
+# ============================================================
+def _parse_expiry(s):
+    """Parse '2026-07-05 14:30 UTC' (and a couple looser variants) into an aware UTC datetime."""
+    if not s or s.strip().upper() == "N/A":
+        return None
+    txt = s.replace("UTC", "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(txt, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+def _parse_price(s):
+    """Parse a logged price like '$408.96' into a float; None if missing/N/A."""
+    if not s or s.strip().upper() == "N/A":
+        return None
+    try:
+        return float(s.replace("$", "").replace(",", "").strip())
+    except ValueError:
+        return None
+
+def _log_outcome(row):
+    # Columns: Signal Timestamp, Account, Symbol, Direction, Confidence, Entry Price,
+    #          Target Price, Stop Price, Outcome, Price at Check, Actual % Move, Checked At
+    sheets_append("Outcomes", row)
+
+def check_outcomes():
+    """Classify past signals whose expiry has passed, and log results to the Outcomes tab.
+    Wrapped in try/except so any failure here never blocks the main signal/trade flow."""
+    try:
+        signals = sheets_read("Signals")
+        if not signals:
+            return
+
+        # Keys of outcomes already recorded: (signal timestamp, account, symbol, direction).
+        done = set()
+        for row in sheets_read("Outcomes"):
+            if len(row) >= 4 and row[0].strip() != "Signal Timestamp":
+                done.add((row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()))
+
+        now = datetime.now(timezone.utc)
+        checked = 0
+        for row in signals:
+            # Signals cols: 0 Timestamp,1 Account,2 Asset,3 Symbol,4 Direction,5 Confidence,
+            #               6 Price,7 Target,8 Stop Loss,9 Time Horizon,10 Exit Trigger,11 Expiry,...
+            if len(row) < 12 or row[0].strip() == "Timestamp":
+                continue  # header or malformed
+            ts, account, symbol, direction = row[0].strip(), row[1].strip(), row[3].strip(), row[4].strip()
+            confidence, entry_str, target_str, stop_str, expiry_str = (
+                row[5].strip(), row[6].strip(), row[7].strip(), row[8].strip(), row[11].strip()
+            )
+
+            key = (ts, account, symbol, direction)
+            if key in done:
+                continue
+
+            # Only score signals whose expiry has actually passed.
+            expiry_dt = _parse_expiry(expiry_str)
+            if expiry_dt is None or now < expiry_dt:
+                continue
+
+            checked_at = now.strftime("%Y-%m-%d %H:%M UTC")
+
+            # No resolvable symbol (or no entry price) — record UNRESOLVED, never guess.
+            entry = _parse_price(entry_str)
+            if not symbol or symbol.upper() == "N/A" or entry is None:
+                _log_outcome([ts, account, symbol or "N/A", direction, confidence, entry_str or "N/A",
+                              "N/A", "N/A", "UNRESOLVED", "N/A", "N/A", checked_at])
+                done.add(key); checked += 1
+                continue
+
+            current = get_price(symbol)
+            if current is None:
+                continue  # can't classify right now — retry on a later cycle
+
+            target_pct = parse_pct(target_str, 5.0)
+            stop_pct = parse_pct(stop_str, 3.0)
+
+            # Derive target/stop PRICES from the logged entry + %, honouring direction.
+            if direction == "bearish":
+                target_price = round(entry * (1 - target_pct / 100), 2)
+                stop_price = round(entry * (1 + stop_pct / 100), 2)
+            else:  # bullish (neutral has no directional bet — treated as long for pricing)
+                target_price = round(entry * (1 + target_pct / 100), 2)
+                stop_price = round(entry * (1 - stop_pct / 100), 2)
+
+            move_pct = (current - entry) / entry * 100  # signed move from entry to check
+
+            if direction == "bullish":
+                outcome = "WIN" if move_pct >= target_pct else "LOSS" if move_pct <= -stop_pct else "EXPIRED_FLAT"
+            elif direction == "bearish":
+                outcome = "WIN" if move_pct <= -target_pct else "LOSS" if move_pct >= stop_pct else "EXPIRED_FLAT"
+            else:
+                outcome = "EXPIRED_FLAT"  # no directional bet to score
+
+            _log_outcome([ts, account, symbol, direction, confidence, f"${entry:.2f}",
+                          f"${target_price:.2f}", f"${stop_price:.2f}", outcome,
+                          f"${current:.2f}", f"{move_pct:+.2f}%", checked_at])
+            done.add(key); checked += 1
+
+        print(f"  [OUTCOMES] Checked {checked} newly-expired signal(s)")
+    except Exception as e:
+        print(f"  [ERROR] Outcomes: {e}")
 
 def log_signal_to_sheets(signal, symbol, current_price):
     try:
@@ -485,6 +608,9 @@ def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=N
 def run():
     global previous_signals
     print(f"\n{'='*50}\nMarket Signal Agent - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*50}")
+
+    print("\n[0/3] Checking outcomes of expired signals...")
+    check_outcomes()
 
     open_symbols = get_open_positions()
     print(f"\n  Open positions: {open_symbols or 'None'}")
