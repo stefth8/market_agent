@@ -231,12 +231,21 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
         sl_price = round(current_price * (1 - stop_pct / 100), 2)
 
         # Re-check the live price before submitting — it may have moved since the quote.
-        # Alpaca rejects a bracket take-profit that isn't strictly above the current base price,
-        # so bump tp_price above that floor when the market has caught up to it.
-        live_price = get_price(symbol) or current_price
+        # If it has diverged more than 2% from the price we sized/priced the trade on,
+        # skip entirely rather than force-fitting TP/SL around a stale entry.
+        live_price = get_price(symbol)
+        if not live_price:
+            print(f"  [SKIP] no live price {symbol}")
+            return None, 0, 0, 0
+        gap = abs(live_price - current_price) / current_price
+        if gap > 0.02:
+            print(f"  [SKIP] price mismatch too large {symbol}: quote ${current_price} vs live ${live_price} ({gap*100:.1f}%)")
+            return None, 0, 0, 0
+
+        # Alpaca rejects a bracket take-profit not strictly above / stop not strictly below the
+        # base price; nudge each clear of the floor after the (small, <=2%) drift check above.
         if tp_price <= live_price + 0.01:
             tp_price = round(live_price + 0.02, 2)
-        # Mirror guard for the stop: Alpaca requires the stop below the current base price.
         if sl_price >= live_price - 0.01:
             sl_price = round(live_price - 0.02, 2)
 
@@ -274,9 +283,22 @@ def resolve_symbol(asset_affected):
     for keyword, etf in ASSET_MAP.items():
         if keyword in asset_lower:
             return etf
-    match = re.search(r'\(([A-Z]{1,5})\)', asset_affected)
-    if match:
-        return match.group(1)
+
+    # If a ticker is given in parentheses, trust ONLY that — never guess from the
+    # surrounding company-name words (that produced false positives like "AG" from
+    # "Continental AG (CON.DE)").
+    paren = re.search(r'\(([^)]*)\)', asset_affected)
+    if paren:
+        inside = paren.group(1).strip()
+        # A dot means a non-US exchange suffix (CON.DE, RIO.L, SHOP.TO, ...) — don't trade it.
+        if "." in inside:
+            return None
+        # Only a bare 1-5 letter US ticker is tradable; anything else is ambiguous.
+        if re.fullmatch(r'[A-Z]{1,5}', inside):
+            return inside
+        return None
+
+    # No parenthetical ticker at all: fall back to a lone uppercase 1-5 letter token.
     for word in asset_affected.split():
         clean = word.strip("().,")
         if clean.isupper() and 1 <= len(clean) <= 5:
