@@ -3,7 +3,7 @@ import json
 import time
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ============================================================
 # CONFIG
@@ -38,8 +38,17 @@ ASSET_MAP = {
 TWEETS_PER_ACCOUNT = 3
 MIN_SIGNAL_SCORE = 8
 RUN_INTERVAL_HOURS = 1
-PAPER_TRADE_SIZE = 1000
 BATCH_SIZE = 10
+DEDUP_WINDOW_MINUTES = 45  # merge same symbol+direction signals whose source tweets fall within this window
+ATR_PERIOD_DAYS = 14
+ATR_TARGET_MULTIPLIER = 2.5   # target = entry ± ATR * this
+ATR_STOP_MULTIPLIER = 1.5     # stop   = entry ± ATR * this  (~1.67:1 reward:risk)
+RISK_PCT_PER_TRADE = 0.01     # max risk per trade as a fraction of current account capital
+MAX_TOTAL_DEPLOYED_PCT = 0.25 # hard cap on total capital deployed across all open positions at once
+SIM_STARTING_BALANCE = 10000  # local paper-sim starting balance — fully independent of the Alpaca account
+SIM_SLIPPAGE_PCT = 0.001      # unfavorable slippage applied to simulated market-style fills (entries, stop/expiry exits)
+
+_atr_cache = {}   # symbol -> ATR ($) for this run only; cleared at the top of run()
 
 previous_signals = {}
 last_seen_ids = {}   # username -> newest tweet id seen so far (high-water mark, in-memory for the process life)
@@ -121,9 +130,10 @@ def init_sheets():
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         
         for sheet_name, cols in [
-            ("Signals", ["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift"]),
-            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID","Close Status","Exit Price","Exit Reason","P&L %","Closed At"]),
-            ("Outcomes", ["Signal Timestamp","Account","Symbol","Direction","Confidence","Entry Price","Target Price","Stop Price","Outcome","Price at Check","Actual % Move","Checked At"])
+            ("Signals", ["Timestamp","Account","Asset","Symbol","Direction","Confidence","Price","Target","Stop Loss","Time Horizon","Exit Trigger","Expiry","Signal Type","Conflict","Sentiment Shift","Ticker Confidence","Ticker Method","Source Tweet","Contributing Accounts","ATR","ATR Target %","ATR Stop %"]),
+            ("Trades", ["Timestamp","Action","Symbol","Entry Price","Take Profit Price","Stop Loss Price","Target %","Stop %","USD Amount","Qty","Account","Asset","Order ID","Close Status","Exit Price","Exit Reason","P&L %","Closed At","Capital At Trade","Risk %"]),
+            ("Outcomes", ["Signal Timestamp","Account","Symbol","Direction","Confidence","Entry Price","Target Price","Stop Price","Outcome","Price at Check","Actual % Move","Checked At"]),
+            ("SimPositions", ["Opened At","Symbol","Direction","Entry Price","Target Price","Stop Price","Qty","USD Amount","Sim Capital At Trade","Contributing Accounts","Confidence","Status","Exit Price","Exit Reason","P&L $","P&L %","Closed At","Expiry"])
         ]:
             url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{sheet_name}!A1"
             r = requests.get(url, headers=headers, timeout=10)
@@ -249,8 +259,14 @@ def check_outcomes():
             if current is None:
                 continue  # can't classify right now — retry on a later cycle
 
-            target_pct = parse_pct(target_str, 5.0)
-            stop_pct = parse_pct(stop_str, 3.0)
+            # Prefer ATR-derived target/stop % (cols 20/21) — what the bot actually traded on.
+            # Fall back to the LLM's original suggestion (cols 7/8) for rows logged before this existed.
+            target_pct = parse_pct(row[20].strip(), None) if len(row) > 20 and row[20].strip() else None
+            stop_pct = parse_pct(row[21].strip(), None) if len(row) > 21 and row[21].strip() else None
+            if target_pct is None:
+                target_pct = parse_pct(target_str, 5.0)
+            if stop_pct is None:
+                stop_pct = parse_pct(stop_str, 3.0)
 
             # Derive target/stop PRICES from the logged entry + %, honouring direction.
             if direction == "bearish":
@@ -277,6 +293,55 @@ def check_outcomes():
         print(f"  [OUTCOMES] Checked {checked} newly-expired signal(s)")
     except Exception as e:
         print(f"  [ERROR] Outcomes: {e}")
+
+def generate_confidence_report():
+    """Correlate signal confidence against actual outcome, bucketed 1-10, using the Outcomes log.
+    Informational only — NOT used for position sizing (sizing is risk-formula-driven, see #4).
+    Rebuilds the whole tab each run since this is a derived snapshot, not an append-only log."""
+    try:
+        rows = sheets_read("Outcomes")
+        buckets = {c: {"WIN": 0, "LOSS": 0, "EXPIRED_FLAT": 0, "UNRESOLVED": 0, "moves": []} for c in range(1, 11)}
+        for row in (rows[1:] if rows else []):
+            if len(row) < 11:
+                continue
+            try:
+                confidence = int(float(row[4].strip()))
+            except ValueError:
+                continue
+            if confidence not in buckets:
+                continue
+            outcome = row[8].strip()
+            if outcome in buckets[confidence]:
+                buckets[confidence][outcome] += 1
+            try:
+                buckets[confidence]["moves"].append(float(row[10].strip().replace("%", "").replace("+", "")))
+            except ValueError:
+                pass
+
+        report_rows = [
+            ["NOTE: informational only — NOT used for position sizing (sizing is risk-formula-driven, see item #4)"],
+            ["Confidence", "Wins", "Losses", "Expired Flat", "Unresolved", "Scored Total", "Win Rate %", "Avg Move %"],
+        ]
+        for c in range(10, 0, -1):
+            b = buckets[c]
+            scored = b["WIN"] + b["LOSS"] + b["EXPIRED_FLAT"]
+            win_rate = (b["WIN"] / scored * 100) if scored else 0.0
+            avg_move = (sum(b["moves"]) / len(b["moves"])) if b["moves"] else 0.0
+            report_rows.append([c, b["WIN"], b["LOSS"], b["EXPIRED_FLAT"], b["UNRESOLVED"], scored,
+                                 f"{win_rate:.1f}%", f"{avg_move:+.2f}%"])
+
+        token = get_sheets_token()
+        if not token:
+            return
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/ConfidenceReport!A1:H{len(report_rows)}?valueInputOption=USER_ENTERED"
+        r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                          json={"values": report_rows}, timeout=15)
+        if r.status_code == 200:
+            print("  [REPORT] Confidence correlation report updated")
+        else:
+            print(f"  [ERROR] Confidence report: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"  [ERROR] Confidence report: {e}")
 
 # ============================================================
 # POSITION CLOSE DETECTION
@@ -362,7 +427,7 @@ def check_closed_positions(current_open):
         # early return in run() can't leave it stale and re-fire duplicate close alerts.
         previous_open_positions = set(current_open)
 
-def log_signal_to_sheets(signal, symbol, current_price):
+def log_signal_to_sheets(signal, symbol, current_price, ticker_confidence, ticker_method, raw_tweet_text, contributing_accounts, atr, atr_target_pct, atr_stop_pct):
     try:
         sheets_append("Signals", [
             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -379,12 +444,19 @@ def log_signal_to_sheets(signal, symbol, current_price):
             signal.get("expiry",""),
             signal.get("signal_type",""),
             "YES" if signal.get("conflicting") else "NO",
-            "YES" if signal.get("sentiment_shift") else "NO"
+            "YES" if signal.get("sentiment_shift") else "NO",
+            ticker_confidence,
+            ticker_method,
+            raw_tweet_text or "N/A",
+            "; ".join(contributing_accounts) if contributing_accounts else "",
+            f"${atr:.2f}" if atr else "N/A",
+            f"{atr_target_pct:.2f}%" if atr_target_pct is not None else "N/A",
+            f"{atr_stop_pct:.2f}%" if atr_stop_pct is not None else "N/A"
         ])
     except Exception as e:
         print(f"  [ERROR] Log signal: {e}")
 
-def log_trade_to_sheets(symbol, entry_price, tp_price, sl_price, target_pct, stop_pct, qty, signal, order_id):
+def log_trade_to_sheets(symbol, entry_price, tp_price, sl_price, target_pct, stop_pct, usd_amount, qty, signal, order_id, capital, risk_pct):
     try:
         sheets_append("Trades", [
             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -395,14 +467,136 @@ def log_trade_to_sheets(symbol, entry_price, tp_price, sl_price, target_pct, sto
             f"${sl_price:.2f}",
             f"+{target_pct}%",
             f"-{stop_pct}%",
-            f"${PAPER_TRADE_SIZE}",
+            f"${usd_amount:.2f}",
             str(qty),
             f"@{str(signal.get('account','')).lstrip('@')}",
             signal.get("asset_affected",""),
-            order_id or ""
+            order_id or "",
+            "", "", "", "", "",  # Close Status, Exit Price, Exit Reason, P&L %, Closed At — filled in on close
+            f"${capital:.2f}",
+            f"{risk_pct*100:.2f}%"
         ])
     except Exception as e:
         print(f"  [ERROR] Log trade: {e}")
+
+# ============================================================
+# LOCAL PAPER-TRADING SIMULATION
+# Fully independent of Alpaca order placement — reads quotes only, never calls /orders.
+# Runs in parallel with the live Alpaca-paper flow so the two can be compared directly.
+# ============================================================
+def get_quote(symbol):
+    """(bid, ask) from Alpaca's latest quote — read-only market data, same feed get_price() uses."""
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol.upper()}/quotes/latest"
+        r = requests.get(url, headers=alpaca_headers(), timeout=10)
+        q = r.json().get("quote", {})
+        bid, ask = q.get("bp"), q.get("ap")
+        return (float(bid) if bid else None, float(ask) if ask else None)
+    except Exception as e:
+        print(f"  [ERROR] Quote {symbol}: {e}")
+        return None, None
+
+def simulate_entry_fill(symbol):
+    """A simulated market buy fills at the ask plus extra unfavorable slippage —
+    never at the exact signal-time price, to model real-world execution."""
+    _, ask = get_quote(symbol)
+    if not ask:
+        return None
+    return round(ask * (1 + SIM_SLIPPAGE_PCT), 2)
+
+def get_sim_state():
+    """Sim capital/deployed/open-symbols derived entirely from the SimPositions log —
+    no separate mutable balance to drift or corrupt."""
+    rows = sheets_read("SimPositions")
+    capital = SIM_STARTING_BALANCE
+    deployed = 0.0
+    open_symbols = set()
+    for i, row in enumerate(rows):
+        if i == 0 or len(row) < 12:
+            continue  # header or malformed
+        status = row[11].strip()
+        symbol = row[1].strip().upper()
+        if status == "OPEN":
+            deployed += _parse_price(row[7]) or 0.0
+            open_symbols.add(symbol)
+        elif len(row) > 14:
+            try:
+                capital += float(row[14].strip().replace("+", ""))
+            except ValueError:
+                pass
+    return capital, deployed, open_symbols
+
+def log_sim_position_open(symbol, direction, entry, target, stop, qty, usd_amount, capital_at_trade, accounts, confidence, expiry):
+    try:
+        sheets_append("SimPositions", [
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            symbol, direction, f"${entry:.2f}", f"${target:.2f}", f"${stop:.2f}",
+            str(qty), f"${usd_amount:.2f}", f"${capital_at_trade:.2f}",
+            "; ".join(accounts) if accounts else "",
+            confidence, "OPEN", "", "", "", "", "", expiry or "N/A"
+        ])
+    except Exception as e:
+        print(f"  [ERROR] Log sim position: {e}")
+
+def check_sim_positions():
+    """Mark OPEN sim positions as TARGET_HIT / STOP_HIT / EXPIRED by comparing current price
+    against target/stop/expiry, and update the row in place. Wrapped so a failure here never
+    blocks the main signal/trade flow."""
+    try:
+        rows = sheets_read("SimPositions")
+        if not rows:
+            return
+        now = datetime.now(timezone.utc)
+        closed = 0
+        for i, row in enumerate(rows):
+            if i == 0 or len(row) < 12 or row[11].strip() != "OPEN":
+                continue  # header, malformed, or already closed
+
+            symbol, direction = row[1].strip(), row[2].strip()
+            entry = _parse_price(row[3])
+            target_price, stop_price = _parse_price(row[4]), _parse_price(row[5])
+            qty = float(row[6]) if row[6].strip() else 0.0
+            usd_amount = _parse_price(row[7]) or 0.0
+            expiry_dt = _parse_expiry(row[17]) if len(row) > 17 else None
+
+            current = get_price(symbol)
+            if current is None or entry is None or target_price is None or stop_price is None:
+                continue  # can't classify right now — retry next cycle
+
+            exit_price, exit_reason, market_exit = None, None, False
+            if direction == "bearish":
+                if current <= target_price:
+                    exit_price, exit_reason = target_price, "Target Hit"
+                elif current >= stop_price:
+                    exit_price, exit_reason, market_exit = stop_price, "Stop Hit", True
+            else:  # bullish / neutral treated as long
+                if current >= target_price:
+                    exit_price, exit_reason = target_price, "Target Hit"
+                elif current <= stop_price:
+                    exit_price, exit_reason, market_exit = stop_price, "Stop Hit", True
+
+            if exit_price is None and expiry_dt and now >= expiry_dt:
+                exit_price, exit_reason, market_exit = current, "Expired", True
+
+            if exit_price is None:
+                continue  # still open
+
+            # Market-style exits (stop/expiry) slip against you; the target exit is a limit fill.
+            if market_exit:
+                exit_price = round(exit_price * (1 - SIM_SLIPPAGE_PCT if direction != "bearish" else 1 + SIM_SLIPPAGE_PCT), 2)
+
+            pnl_dollars = (exit_price - entry) * qty if direction != "bearish" else (entry - exit_price) * qty
+            pnl_pct = (pnl_dollars / usd_amount * 100) if usd_amount else 0.0
+            status = exit_reason.upper().replace(" ", "_")
+            closed_at = now.strftime("%Y-%m-%d %H:%M UTC")
+
+            row_num = i + 1
+            sheets_update(f"SimPositions!L{row_num}:Q{row_num}",
+                          [status, f"${exit_price:.2f}", exit_reason, f"{pnl_dollars:+.2f}", f"{pnl_pct:+.2f}%", closed_at])
+            closed += 1
+        print(f"  [SIM] Closed {closed} simulated position(s)")
+    except Exception as e:
+        print(f"  [ERROR] Sim positions check: {e}")
 
 # ============================================================
 # ALPACA
@@ -435,6 +629,82 @@ def get_open_positions():
         print(f"  [ERROR] Get positions: {e}")
         return set()
 
+def get_account_equity():
+    """Total account value from Alpaca (paper by default, per ALPACA_BASE_URL) — the capital
+    base for risk sizing. None on any failure; callers must skip trading rather than guess."""
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/account", headers=alpaca_headers(), timeout=10)
+        if r.status_code == 200:
+            equity = r.json().get("equity")
+            return float(equity) if equity is not None else None
+        print(f"  [ERROR] Account: {r.status_code} {r.text[:120]}")
+        return None
+    except Exception as e:
+        print(f"  [ERROR] Account: {e}")
+        return None
+
+def get_deployed_capital():
+    """Sum of market value across all open positions — used against MAX_TOTAL_DEPLOYED_PCT."""
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_headers(), timeout=10)
+        if r.status_code == 200:
+            return sum(float(p.get("market_value", 0) or 0) for p in r.json())
+        return 0.0
+    except Exception as e:
+        print(f"  [ERROR] Deployed capital: {e}")
+        return 0.0
+
+def calculate_position_size(capital, entry_price, stop_price, risk_pct=RISK_PCT_PER_TRADE):
+    """Risk-based sizing: risk risk_pct of current capital on the entry-to-stop distance.
+    Returns share quantity (not USD notional)."""
+    per_share_risk = abs(entry_price - stop_price)
+    if per_share_risk <= 0:
+        return 0.0
+    return (capital * risk_pct) / per_share_risk
+
+def get_daily_bars(symbol, limit):
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol.upper()}/bars"
+        r = requests.get(url, headers=alpaca_headers(),
+                          params={"timeframe": "1Day", "limit": limit, "adjustment": "raw"}, timeout=10)
+        if r.status_code != 200:
+            print(f"  [ERROR] Bars {symbol}: {r.status_code} {r.text[:120]}")
+            return []
+        return r.json().get("bars", []) or []
+    except Exception as e:
+        print(f"  [ERROR] Bars {symbol}: {e}")
+        return []
+
+def get_atr(symbol, period=ATR_PERIOD_DAYS):
+    """Average True Range over `period` daily bars. None if there isn't enough history —
+    callers must treat that as 'can't size this trade', never guess a fixed % instead."""
+    if symbol in _atr_cache:
+        return _atr_cache[symbol]
+    bars = get_daily_bars(symbol, period + 1)
+    atr = None
+    if len(bars) >= 2:
+        trs = []
+        for i in range(1, len(bars)):
+            high, low, prev_close = bars[i]["h"], bars[i]["l"], bars[i-1]["c"]
+            trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        trs = trs[-period:]
+        if trs:
+            atr = sum(trs) / len(trs)
+    _atr_cache[symbol] = atr
+    return atr
+
+def atr_target_stop(entry_price, atr, direction):
+    """Scale target/stop to this ticker's own recent volatility instead of a fixed %."""
+    if direction == "bearish":
+        target_price = round(entry_price - atr * ATR_TARGET_MULTIPLIER, 2)
+        stop_price = round(entry_price + atr * ATR_STOP_MULTIPLIER, 2)
+    else:  # bullish / neutral — neutral has no directional bet but priced long for consistency with check_outcomes
+        target_price = round(entry_price + atr * ATR_TARGET_MULTIPLIER, 2)
+        stop_price = round(entry_price - atr * ATR_STOP_MULTIPLIER, 2)
+    target_pct = abs(target_price - entry_price) / entry_price * 100
+    stop_pct = abs(stop_price - entry_price) / entry_price * 100
+    return target_price, stop_price, target_pct, stop_pct
+
 def parse_pct(pct_str, default=5.0):
     try:
         clean = str(pct_str).replace("%","").replace("+","").strip()
@@ -449,14 +719,12 @@ def parse_pct(pct_str, default=5.0):
     except:
         return default
 
-def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_pct_str):
+def place_bracket_order(symbol, current_price, qty, target_pct, stop_pct):
     try:
-        qty = round(usd_amount / current_price, 6)
+        qty = round(qty, 6)
         if qty <= 0:
             return None, 0, 0, 0
 
-        target_pct = parse_pct(target_pct_str, 5.0)
-        stop_pct = parse_pct(stop_pct_str, 3.0)
         tp_price = round(current_price * (1 + target_pct / 100), 2)
         sl_price = round(current_price * (1 - stop_pct / 100), 2)
 
@@ -509,31 +777,101 @@ def place_bracket_order(symbol, current_price, usd_amount, target_pct_str, stop_
 # SYMBOL RESOLVER
 # ============================================================
 def resolve_symbol(asset_affected):
-    asset_lower = asset_affected.lower()
-    for keyword, etf in ASSET_MAP.items():
-        if keyword in asset_lower:
-            return etf
-
-    # If a ticker is given in parentheses, trust ONLY that — never guess from the
-    # surrounding company-name words (that produced false positives like "AG" from
-    # "Continental AG (CON.DE)").
+    """Resolve a ticker only when the tweet explicitly names it.
+    Returns (symbol_or_None, ticker_confidence 0-10, method)."""
     paren = re.search(r'\(([^)]*)\)', asset_affected)
     if paren:
         inside = paren.group(1).strip()
-        # A dot means a non-US exchange suffix (CON.DE, RIO.L, SHOP.TO, ...) — don't trade it.
+        # A dot means a non-US exchange suffix (CON.DE, RIO.L, SHOP.TO, ...) — don't trade it,
+        # and don't fall through to keyword matching either: an explicit foreign ticker means
+        # the intent was clear, just not tradable here.
         if "." in inside:
-            return None
-        # Only a bare 1-5 letter US ticker is tradable; anything else is ambiguous.
+            return None, 0, "non_us_exchange"
+        # A bare 1-5 letter US ticker is the most explicit signal — trust it outright.
         if re.fullmatch(r'[A-Z]{1,5}', inside):
-            return inside
-        return None
+            return inside, 10, "explicit_ticker"
+        # Parenthetical present but not a valid ticker (e.g. "Apple (tech)") — fall through
+        # to the keyword check below rather than dropping the signal.
 
-    # No parenthetical ticker at all: fall back to a lone uppercase 1-5 letter token.
-    for word in asset_affected.split():
-        clean = word.strip("().,")
-        if clean.isupper() and 1 <= len(clean) <= 5:
-            return clean
+    # No usable parenthetical ticker: only a whole-word commodity/asset match, never a
+    # substring (this is what silently mapped "spoil"/"boiling"/"turmoil" to USO before).
+    asset_lower = asset_affected.lower()
+    for keyword, etf in ASSET_MAP.items():
+        if re.search(rf'\b{re.escape(keyword)}\b', asset_lower):
+            return etf, 6, "keyword_map"
+
+    return None, 0, "no_explicit_ticker"
+
+def _parse_tweet_dt(s):
+    """Best-effort parse of a tweet's created_at into an aware UTC datetime. None if unparseable
+    (an unparseable timestamp just means that signal won't be merged with anything — safe failure)."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
     return None
+
+def _safe_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+def _merge_cluster(cluster):
+    """Pick the highest-confidence signal as primary; attach a clean list of every
+    contributing account instead of concatenating them into the account field."""
+    primary = max(cluster, key=lambda s: (_safe_int(s.get("confidence")), s["_dt"] or datetime.min.replace(tzinfo=timezone.utc)))
+    accounts, seen = [], set()
+    for s in cluster:
+        acct = str(s.get("account", "")).lstrip("@")
+        if acct and acct not in seen:
+            seen.add(acct)
+            accounts.append(acct)
+    merged = dict(primary)
+    merged["_contributing_accounts"] = accounts
+    return merged
+
+def resolve_and_dedup_signals(all_signals):
+    """Resolve each signal's ticker, then collapse same-symbol+direction signals whose
+    source tweets fall within DEDUP_WINDOW_MINUTES of each other into one."""
+    for s in all_signals:
+        symbol, ticker_confidence, ticker_method = resolve_symbol(s.get("asset_affected", ""))
+        s["_symbol"] = symbol
+        s["_ticker_confidence"] = ticker_confidence
+        s["_ticker_method"] = ticker_method
+        s["_dt"] = _parse_tweet_dt(s.get("_source_created_at"))
+
+    # Only resolved symbols are dedup candidates — N/A signals pass through untouched.
+    groups, passthrough = {}, []
+    for s in all_signals:
+        if not s["_symbol"]:
+            passthrough.append(s)
+            continue
+        groups.setdefault((s["_symbol"], s.get("direction")), []).append(s)
+
+    deduped = []
+    for sigs in groups.values():
+        sigs.sort(key=lambda s: s["_dt"] or datetime.min.replace(tzinfo=timezone.utc))
+        cluster = [sigs[0]]
+        for s in sigs[1:]:
+            anchor, cur = cluster[0]["_dt"], s["_dt"]
+            if anchor and cur and (cur - anchor) <= timedelta(minutes=DEDUP_WINDOW_MINUTES):
+                cluster.append(s)
+            else:
+                deduped.append(_merge_cluster(cluster))
+                cluster = [s]
+        deduped.append(_merge_cluster(cluster))
+    return deduped + passthrough
 
 # ============================================================
 # FETCH TWEETS
@@ -588,8 +926,10 @@ STRICT RULES - only flag signals that are DIRECTLY market-moving:
 INCLUDE: earnings beats/misses, CEO changes, mergers/acquisitions, central bank decisions, war escalation with specific supply impact, regulatory actions, major macro data releases
 EXCLUDE: retweets of general news, social commentary, opinion posts, product demos, general AI hype, vague geopolitical commentary, SpaceX launches
 
-Return a JSON array where each item has:
-- "account", "tweet_summary", "asset_affected" (specific ticker e.g. "Apple (AAPL)", "Gold (GLD)"),
+Each tweet below is numbered like "[3] @user (...):". Return a JSON array where each item has:
+- "source_index" (the exact [N] of the ONE tweet that generated this signal),
+- "account", "tweet_summary",
+- "asset_affected" (ONLY include a parenthetical ticker, e.g. "Apple (AAPL)", "Gold (GLD)", if the tweet EXPLICITLY names that specific company, index, or commodity/ETF. If the tweet describes a market-moving event without naming a specific tradable instrument, describe the asset with NO parenthetical ticker — never guess or infer one.),
 - "signal_type", "direction" (bullish/bearish/neutral), "confidence" (1-10),
 - "price_target" (e.g. "+5%"), "stop_loss" (e.g. "-3%"), "time_horizon" (e.g. "2-3 days"),
 - "exit_trigger", "expiry", "conflicting" (true/false), "conflict_note",
@@ -599,8 +939,32 @@ Calculate "expiry" as an absolute date/time (e.g. "2026-07-05 14:30 UTC") measur
 
 Only include confidence >= {MIN_SIGNAL_SCORE}. Be conservative. Return [] if none. JSON only, no extra text."""
 
+def _attach_raw_text(signals, tweets_batch):
+    """Attach ground-truth raw tweet text via Claude's source_index — never trust the
+    model's own paraphrase for the audit trail."""
+    if not isinstance(signals, list):
+        return signals
+    by_account = {}
+    for t in tweets_batch:
+        by_account.setdefault(t["username"], []).append(t)
+    for s in signals:
+        tweet = None
+        try:
+            idx = int(s.get("source_index"))
+            if 1 <= idx <= len(tweets_batch):
+                tweet = tweets_batch[idx - 1]
+        except (TypeError, ValueError):
+            pass
+        if tweet is None:
+            candidates = by_account.get(str(s.get("account", "")).lstrip("@"), [])
+            if len(candidates) == 1:
+                tweet = candidates[0]
+        s["_raw_tweet_text"] = tweet["text"] if tweet else ""
+        s["_source_created_at"] = tweet["created_at"] if tweet else ""
+    return signals
+
 def analyse_batch(tweets_batch, prev_signals):
-    tweets_text = "\n".join([f"\n@{t['username']} ({t['created_at']}):\n{t['text']}" for t in tweets_batch])
+    tweets_text = "\n".join([f"\n[{i+1}] @{t['username']} ({t['created_at']}):\n{t['text']}" for i, t in enumerate(tweets_batch)])
     prev_text = ""
     if prev_signals:
         prev_text = "\n\nPREVIOUS SIGNALS:\n" + "\n".join([f"- {a}: {i['direction']} ({i['confidence']}/10)" for a, i in prev_signals.items()])
@@ -633,7 +997,7 @@ def analyse_batch(tweets_batch, prev_signals):
                 raw = raw[4:]
         raw = raw.strip()
         try:
-            return json.loads(raw)
+            return _attach_raw_text(json.loads(raw), tweets_batch)
         except:
             start = raw.find("[")
             if start == -1:
@@ -646,7 +1010,7 @@ def analyse_batch(tweets_batch, prev_signals):
                     depth -= 1
                     if depth == 0:
                         try:
-                            return json.loads(raw[start:i+1])
+                            return _attach_raw_text(json.loads(raw[start:i+1]), tweets_batch)
                         except:
                             return []
             return []
@@ -676,26 +1040,31 @@ def send_telegram(message):
 # ============================================================
 # FORMAT ALERT
 # ============================================================
-def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=None, traded=False, is_conflict=False):
+def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=None, qty=0, traded=False, is_conflict=False):
     emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}.get(signal.get("direction","neutral"), "⚪")
     header = "⚠️ CONFLICTING SIGNAL - NO TRADE" if is_conflict else "🚨 Market Signal Alert"
     price_str = f"${current_price:.2f}" if current_price else "N/A"
 
     trade_line = ""
     if traded and tp_price and sl_price:
-        trade_line = f"\n📈 Paper Trade: BUY ${PAPER_TRADE_SIZE} of {symbol} @ {price_str}\n🎯 Take Profit: ${tp_price} | 🛑 Stop Loss: ${sl_price}"
+        usd_amount = qty * current_price
+        trade_line = f"\n📈 Trade: BUY ${usd_amount:.2f} ({qty} sh) of {symbol} @ {price_str}\n🎯 Take Profit: ${tp_price} | 🛑 Stop Loss: ${sl_price}"
 
     account = str(signal.get('account','?')).lstrip('@')
+    contributors = signal.get("_contributing_accounts") or [account]
+    accounts_line = ", ".join(f"@{a}" for a in contributors)
+    if len(contributors) > 1:
+        accounts_line += f" ({len(contributors)} accounts)"
     msg = (
         f"{header}\n\n"
-        f"👤 @{account}\n"
+        f"👤 {accounts_line}\n"
         f"📌 Asset: {signal.get('asset_affected','?')}\n"
         f"🔤 Symbol: {symbol or 'N/A'}\n"
         f"💰 Price: {price_str}\n"
         f"{emoji} Direction: {signal.get('direction','?').upper()}\n"
         f"📝 Signal: {signal.get('tweet_summary','?')}\n\n"
-        f"🎯 Target: {signal.get('price_target','N/A')}\n"
-        f"🛑 Stop Loss: {signal.get('stop_loss','N/A')}\n"
+        f"🎯 LLM-Suggested Target: {signal.get('price_target','N/A')}\n"
+        f"🛑 LLM-Suggested Stop: {signal.get('stop_loss','N/A')}\n"
         f"⏱ Hold: {signal.get('time_horizon','N/A')}\n"
         f"🚪 Exit: {signal.get('exit_trigger','N/A')}\n"
         f"⌛ Expires: {signal.get('expiry','N/A')}\n"
@@ -714,14 +1083,19 @@ def format_signal_alert(signal, symbol, current_price, tp_price=None, sl_price=N
 # ============================================================
 def run():
     global previous_signals
+    _atr_cache.clear()
     print(f"\n{'='*50}\nMarket Signal Agent - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*50}")
 
     print("\n[0/3] Checking outcomes of expired signals...")
     check_outcomes()
+    generate_confidence_report()
 
     open_symbols = get_open_positions()
     print(f"\n  Open positions: {open_symbols or 'None'}")
     check_closed_positions(open_symbols)
+
+    print("  Checking simulated paper positions...")
+    check_sim_positions()
 
     all_tweets = []
     active, skipped = 0, 0
@@ -774,39 +1148,100 @@ def run():
         accounts = ", ".join([f"@{str(s.get('account','')).lstrip('@')}" for s in sigs])
         send_telegram(f"⚠️ CONFLICTING SIGNALS - DO NOT TRADE\n\nAsset: {asset}\nFrom: {accounts}\nRecommendation: Wait for clarity\n🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
+    pre_dedup_count = len(all_signals)
+    all_signals = resolve_and_dedup_signals(all_signals)
+    print(f"  Deduplicated {pre_dedup_count} -> {len(all_signals)} signal(s) (window={DEDUP_WINDOW_MINUTES}m)")
+
+    capital = get_account_equity()
+    if capital is None or capital <= 0:
+        print("  [ERROR] Could not read account equity — skipping all live trading this cycle (signals still logged/alerted).")
+        deployed, max_deployed = 0.0, 0.0
+    else:
+        deployed = get_deployed_capital()
+        max_deployed = capital * MAX_TOTAL_DEPLOYED_PCT
+        print(f"  Capital: ${capital:.2f} | Deployed: ${deployed:.2f} | Cap: ${max_deployed:.2f} ({MAX_TOTAL_DEPLOYED_PCT*100:.0f}%)")
+
+    sim_capital, sim_deployed, sim_open_symbols = get_sim_state()
+    sim_max_deployed = sim_capital * MAX_TOTAL_DEPLOYED_PCT
+    print(f"  Sim Capital: ${sim_capital:.2f} | Sim Deployed: ${sim_deployed:.2f} | Sim Cap: ${sim_max_deployed:.2f}")
+
     traded_symbols = set()
+    sim_traded_symbols = set()
     for signal in all_signals:
         asset = signal.get("asset_affected","")
         is_conflict = asset in conflicts
-        symbol = resolve_symbol(asset)
+        symbol = signal.get("_symbol")
+        ticker_confidence = signal.get("_ticker_confidence", 0)
+        ticker_method = signal.get("_ticker_method", "no_explicit_ticker")
         current_price = get_price(symbol) if symbol else None
+        contributing_accounts = signal.get("_contributing_accounts") or [str(signal.get("account","")).lstrip("@")]
+        direction = signal.get("direction","neutral")
+
+        atr = get_atr(symbol) if symbol and current_price else None
+        if atr:
+            _, atr_stop_price, atr_target_pct, atr_stop_pct = atr_target_stop(current_price, atr, direction)
+        else:
+            atr_stop_price = atr_target_pct = atr_stop_pct = None
 
         # Log every signal to Google Sheets
-        log_signal_to_sheets(signal, symbol, current_price)
+        log_signal_to_sheets(signal, symbol, current_price, ticker_confidence, ticker_method, signal.get("_raw_tweet_text", ""),
+                              contributing_accounts, atr, atr_target_pct, atr_stop_pct)
 
         order, tp_price, sl_price, qty = None, None, None, 0
+        can_trade = symbol and current_price and atr and not is_conflict and direction == "bullish"
 
-        if symbol and current_price and not is_conflict:
-            direction = signal.get("direction","neutral")
-            if direction == "bullish" and symbol not in open_symbols and symbol not in traded_symbols:
-                target_pct_str = signal.get("price_target", "+5%")
-                stop_pct_str = signal.get("stop_loss", "-3%")
+        if can_trade and capital and symbol not in open_symbols and symbol not in traded_symbols:
+            sized_qty = calculate_position_size(capital, current_price, atr_stop_price, RISK_PCT_PER_TRADE)
+            trade_usd = sized_qty * current_price
+            if sized_qty <= 0:
+                print(f"  [SKIP] {symbol} position size computed as 0")
+            elif deployed + trade_usd > max_deployed:
+                print(f"  [SKIP] {symbol} would breach total deployed-capital cap: "
+                      f"${deployed:.2f} + ${trade_usd:.2f} > ${max_deployed:.2f}")
+            else:
                 order, tp_price, sl_price, qty = place_bracket_order(
-                    symbol, current_price, PAPER_TRADE_SIZE, target_pct_str, stop_pct_str
+                    symbol, current_price, sized_qty, atr_target_pct, atr_stop_pct
                 )
                 if order:
                     traded_symbols.add(symbol)
+                    deployed += qty * current_price  # reserve for subsequent signals this run
                     log_trade_to_sheets(symbol, current_price, tp_price, sl_price,
-                                       parse_pct(target_pct_str), parse_pct(stop_pct_str),
-                                       qty, signal, order.get("id"))
-            elif symbol in open_symbols:
-                print(f"  [SKIP] {symbol} already open")
-            elif symbol in traded_symbols:
-                print(f"  [SKIP] {symbol} already traded this run")
+                                       round(atr_target_pct, 2), round(atr_stop_pct, 2),
+                                       qty * current_price, qty, signal, order.get("id"),
+                                       capital, RISK_PCT_PER_TRADE)
+        elif can_trade and symbol in open_symbols:
+            print(f"  [SKIP] {symbol} already open")
+        elif can_trade and symbol in traded_symbols:
+            print(f"  [SKIP] {symbol} already traded this run")
+        elif symbol and current_price and not atr and not is_conflict and direction == "bullish":
+            print(f"  [SKIP] {symbol} no ATR data — can't size a volatility-scaled stop")
+        elif can_trade and not capital:
+            print(f"  [SKIP] {symbol} no account equity available — can't size live position")
+
+        # Local paper-trading simulation — independent ledger, no Alpaca order calls.
+        if can_trade and symbol not in sim_open_symbols and symbol not in sim_traded_symbols:
+            sim_entry = simulate_entry_fill(symbol)
+            if sim_entry:
+                sim_target_price, sim_stop_price, _, _ = atr_target_stop(sim_entry, atr, direction)
+                sim_qty = round(calculate_position_size(sim_capital, sim_entry, sim_stop_price, RISK_PCT_PER_TRADE), 6)
+                sim_usd = sim_qty * sim_entry
+                if sim_qty <= 0:
+                    print(f"  [SIM][SKIP] {symbol} position size computed as 0")
+                elif sim_deployed + sim_usd > sim_max_deployed:
+                    print(f"  [SIM][SKIP] {symbol} would breach sim deployed-capital cap: "
+                          f"${sim_deployed:.2f} + ${sim_usd:.2f} > ${sim_max_deployed:.2f}")
+                else:
+                    log_sim_position_open(symbol, direction, sim_entry, sim_target_price, sim_stop_price,
+                                          sim_qty, sim_usd, sim_capital, contributing_accounts,
+                                          signal.get("confidence",""), signal.get("expiry",""))
+                    sim_traded_symbols.add(symbol)
+                    sim_deployed += sim_usd
+            else:
+                print(f"  [SIM][SKIP] {symbol} no quote available for simulated fill")
 
         price_str = f"${current_price:.2f}" if current_price else "N/A"
         print(f"\n  -> {asset} | {signal.get('direction')} | {signal.get('confidence')}/10 | {symbol} @ {price_str}")
-        send_telegram(format_signal_alert(signal, symbol, current_price, tp_price, sl_price, order is not None, is_conflict))
+        send_telegram(format_signal_alert(signal, symbol, current_price, tp_price, sl_price, qty, order is not None, is_conflict))
 
     previous_signals = {
         s.get("asset_affected",""): {"direction": s.get("direction"), "confidence": s.get("confidence")}
